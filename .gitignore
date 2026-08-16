@@ -16,3 +16,4 @@ mv_dump/
 # Python
 __pycache__/
 *.pyc
+old/
