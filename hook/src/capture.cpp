@@ -1,0 +1,1503 @@
+#include "capture.h"
+
+#include "depth_identify.h"
+#include "logging.h"
+#include "velocity_identify.h"
+#include "view_cb.h"
+
+#include <windows.h>
+#include <wrl/client.h>
+
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+using Microsoft::WRL::ComPtr;
+
+namespace mv
+{
+namespace
+{
+
+// Frames per F8 burst; each frame writes velocity + back buffer. ~1s of
+// gameplay, enough for video and N-1/N warp validation pairs.
+constexpr int kCaptureFrames = 60;
+
+// Slots in flight. GPU trails CPU by a few frames, so copies aren't
+// immediately readable; round-robin and map only once the fence passes.
+constexpr int kSlots = 4;
+
+// A Recording slot waits for the Present sharing its frame index. If that
+// Present never comes (abandoned frame, resolution change, skipped Present),
+// reclaim it rather than stall capture forever.
+constexpr unsigned long long kSlotStaleAfterFrames = 8;
+
+// Cap on depth copies per frame ("last one wins"). UE5 normally transitions
+// depth out of DEPTH_WRITE 1-2x/frame; the cap bounds bandwidth if a title's
+// frame graph does something unexpected.
+constexpr int kMaxDepthCopiesPerFrame = 4;
+
+// Recording from the first copy (velocity or depth, whichever comes first)
+// until the Present that pairs it with the back buffer and submits.
+enum class SlotState
+{
+    Free,
+    Recording,
+    Submitted
+};
+
+struct Slot
+{
+    ComPtr<ID3D12Resource> velocityBuffer;
+    ComPtr<ID3D12Resource> colorBuffer;
+    ComPtr<ID3D12Resource> depthBuffer;
+    // DEFAULT-heap UAV the compute shader writes into (can't write READBACK
+    // directly); copied into viewCbReadback afterward.
+    ComPtr<ID3D12Resource> viewCbUav;
+    ComPtr<ID3D12Resource> viewCbReadback;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> commandList;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> velocityFootprints;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> colorFootprints;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> depthFootprints;
+    // Descs the footprints were derived from; compared every frame since
+    // footprints are only valid for the exact layout they came from.
+    D3D12_RESOURCE_DESC velocityDesc{};
+    D3D12_RESOURCE_DESC colorDesc{};
+    D3D12_RESOURCE_DESC depthDesc{};
+    UINT64 velocityBytes = 0;
+    UINT64 colorBytes = 0;
+    UINT64 depthBytes = 0;
+    UINT velocitySubresources = 0;
+    UINT colorSubresources = 0;
+    UINT depthSubresources = 0;
+    UINT64 fenceValue = 0;
+    unsigned long long frameIndex = 0;
+    int captureIndex = 0;
+    SlotState state = SlotState::Free;
+    bool hasVelocity = false;
+    bool hasDepth = false;
+    int depthCopies = 0;
+    ViewCbCandidate viewCbCandidates[kViewCbCandidates]{};
+    int viewCbCount = 0;
+    // Identity of the command list the velocity copy was recorded onto. Used
+    // only as a key to check submission - never dereferenced, we hold no ref.
+    IUnknown* recordedList = nullptr;
+    bool velocitySubmitted = false;
+    // Submission count on our queue at the moment the copy was recorded, for
+    // the ordering-based fallback when list identity is not observable.
+    uint64_t queueSubmissionsAtRecord = 0;
+};
+
+// Canonical COM identity: QueryInterface(IID_IUnknown) is the only pointer
+// guaranteed equal for the same object. Matters here because under the D3D12
+// debug layer, ResourceBarrier's command-list pointer and the one passed to
+// ExecuteCommandLists are different wrapper objects - raw pointer comparison
+// fails. Safe to call: the object is alive at both call sites.
+IUnknown* ComIdentity(IUnknown* object)
+{
+    if (object == nullptr)
+    {
+        return nullptr;
+    }
+    IUnknown* identity = nullptr;
+    if (FAILED(object->QueryInterface(IID_PPV_ARGS(&identity))) || identity == nullptr)
+    {
+        return object;
+    }
+    identity->Release(); // we want the address as a key, not a reference
+    return identity;
+}
+
+// Whether a cached footprint set still matches this resource's layout.
+bool SameLayout(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b)
+{
+    return a.Dimension == b.Dimension && a.Width == b.Width && a.Height == b.Height &&
+           a.DepthOrArraySize == b.DepthOrArraySize && a.MipLevels == b.MipLevels && a.Format == b.Format &&
+           a.SampleDesc.Count == b.SampleDesc.Count && a.Layout == b.Layout;
+}
+
+std::string DescToString(const D3D12_RESOURCE_DESC& d)
+{
+    return std::to_string(d.Width) + "x" + std::to_string(d.Height) +
+           " fmt=" + std::to_string(static_cast<int>(d.Format)) + " mips=" + std::to_string(d.MipLevels) +
+           " arr=" + std::to_string(d.DepthOrArraySize) + " samples=" + std::to_string(d.SampleDesc.Count);
+}
+
+ResourceBarrierFn g_originalResourceBarrier = nullptr;
+ExecuteCommandListsFn g_originalExecuteCommandLists = nullptr;
+
+std::mutex g_mutex;
+Slot g_slots[kSlots];
+ComPtr<ID3D12Device> g_device;
+ComPtr<ID3D12CommandQueue> g_queue;
+ComPtr<ID3D12Fence> g_fence;
+UINT64 g_nextFenceValue = 1;
+
+// Fence-coverage accounting, summarised once per burst. Three outcomes:
+//   strong - the exact recorded command list was seen submitted to the fenced
+//            queue; the fence covers the copy.
+//   weak   - list identity wasn't observable (e.g. under the debug layer's
+//            wrapper), but the queue did submit after recording. Consistent,
+//            not proven.
+//   none   - nothing submitted in between; readback is genuinely unsafe.
+std::atomic<uint64_t> g_coverageStrong{0};
+std::atomic<uint64_t> g_coverageWeak{0};
+std::atomic<uint64_t> g_coverageNone{0};
+std::atomic<uint64_t> g_queueSubmissions{0};
+
+std::atomic<int> g_framesRemaining{0};
+
+// Hard cap on Presents a burst may span. g_framesRemaining alone counts
+// frames submitted, so a burst that never lands the requested count would
+// otherwise run forever with F8 dead for the rest of the session.
+constexpr int kBurstPresentBudget = kCaptureFrames * 8;
+std::atomic<int> g_burstPresentsLeft{0};
+
+// Armed by the hotkey; begins at the next Present. F8 can arrive mid-frame,
+// after depth edges or View-buffer binds have already gone past - starting
+// at the next frame boundary guarantees the first captured frame is seen
+// from the start.
+std::atomic<bool> g_burstArmed{false};
+
+// Turns on root-CBV bind counting immediately (live for the whole first
+// captured frame) and arms the burst for the next Present.
+void ArmBurst()
+{
+    ViewCbSetTracking(true);
+    g_burstArmed.store(true, std::memory_order_relaxed);
+}
+
+// Frames skipped because every ring slot was in flight. Diagnostic only -
+// distinguishes "ring busy as designed" from "ring wedged".
+std::atomic<uint64_t> g_noFreeSlot{0};
+std::atomic<unsigned long long> g_frameIndex{0};
+std::atomic<int> g_captureCounter{0};
+std::atomic<bool> g_metadataWritten{false};
+
+// F8 hotkey thread, joinable rather than detached, with a stop flag.
+//
+// A detached thread looping forever crashes on the FreeLibrary teardown
+// path: the module unmaps while the thread is still running, so its next
+// instruction is in freed memory (STATUS_STACK_BUFFER_OVERRUN). Never seen
+// in a shipping game, since it never unloads; testhost exercises teardown
+// on every run.
+std::atomic<bool> g_hotkeyStop{false};
+std::thread g_hotkeyThread;
+
+std::atomic<bool> g_depthMetadataWritten{false};
+std::atomic<bool> g_viewCbMetadataWritten{false};
+std::atomic<uint64_t> g_depthEdgeReports{0};
+std::atomic<bool> g_depthAfterVelocityReported{false};
+std::atomic<bool> g_viewCbFallbackReported{false};
+std::atomic<bool> g_viewCbEverSeen{false};
+// Frames where depth arrived but velocity never did. Counted rather than
+// silently discarded - worth surfacing in the log.
+std::atomic<uint64_t> g_framesWithoutVelocity{0};
+std::atomic<uint64_t> g_incompleteFrames{0};
+
+// ---------------------------------------------------------------------------
+// Background writer. Disk I/O never happens on the render thread - a
+// synchronous per-frame write there is a stall that can expose latent bugs
+// in the game (see DEBUGGING.md). Render thread only memcpy's out of the
+// mapped buffer and hands the bytes off.
+// ---------------------------------------------------------------------------
+
+struct WriteJob
+{
+    std::string path;
+    std::vector<uint8_t> data;
+    bool append = false;
+};
+
+// Backpressure cap. An unbounded queue never stalls the render thread but
+// risks an unbounded memory spike if disk can't keep up with capture rate.
+// Drop instead: a short capture is recoverable, OOM elsewhere isn't. Drops
+// are counted and logged so offline tools see why indices have gaps.
+constexpr size_t kMaxQueuedBytes = 512ull * 1024 * 1024;
+
+std::mutex g_writeMutex;
+std::condition_variable g_writeCv;
+std::deque<WriteJob> g_writeQueue;
+size_t g_queuedBytes = 0;
+bool g_writerStarted = false;
+bool g_writerStop = false;
+std::thread g_writerThread;
+std::atomic<uint64_t> g_droppedWrites{0};
+std::atomic<uint64_t> g_droppedFrames{0};
+
+std::string DumpDir()
+{
+    // MV_DUMP_DIR overrides the destination, so testhost's synthetic frames
+    // never overwrite a real capture.
+    char override[MAX_PATH]{};
+    if (GetEnvironmentVariableA("MV_DUMP_DIR", override, MAX_PATH) != 0)
+    {
+        std::string dir = override;
+        if (!dir.empty() && dir.back() != '\\' && dir.back() != '/')
+        {
+            dir += '\\';
+        }
+        CreateDirectoryA(dir.c_str(), nullptr);
+        return dir;
+    }
+    char tempPath[MAX_PATH]{};
+    GetTempPathA(MAX_PATH, tempPath);
+    std::string dir = std::string(tempPath) + "mv_dump\\";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    return dir;
+}
+
+// MV_CAPTURE_DEPTH=0 disables the depth copy for a session - a bandwidth
+// isolation test, not a feature, to separate depth-copy cost from other
+// causes of dropped frames.
+//
+// Read once: it's consulted on the barrier hot path, and changing mid-session
+// would produce frames that aren't alike (see the completeness rule below).
+bool DepthCaptureEnabled()
+{
+    static const bool enabled = []
+    {
+        char value[8]{};
+        const DWORD length = GetEnvironmentVariableA("MV_CAPTURE_DEPTH", value, sizeof(value));
+        if (length == 0 || length >= sizeof(value))
+        {
+            return true;
+        }
+        const bool off = std::string(value, length) == "0";
+        if (off)
+        {
+            Log("capture: MV_CAPTURE_DEPTH=0 - scene depth will NOT be copied this session. The dump "
+                "will have no meta_depth.txt and no depth_*.bin, so the analytical reprojection cannot "
+                "run on it. This is the bandwidth control test, not a normal capture.");
+        }
+        return !off;
+    }();
+    return enabled;
+}
+
+void WriterThread()
+{
+    for (;;)
+    {
+        WriteJob job;
+        {
+            std::unique_lock<std::mutex> lock(g_writeMutex);
+            g_writeCv.wait(lock, [] { return !g_writeQueue.empty() || g_writerStop; });
+            if (g_writeQueue.empty())
+            {
+                return; // stopping, and everything queued has been written
+            }
+            job = std::move(g_writeQueue.front());
+            g_writeQueue.pop_front();
+            g_queuedBytes -= job.data.size();
+        }
+        HANDLE file = CreateFileA(
+            job.path.c_str(),
+            job.append ? FILE_APPEND_DATA : GENERIC_WRITE,
+            FILE_SHARE_READ,
+            nullptr,
+            job.append ? OPEN_ALWAYS : CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            Log("capture: failed to open " + job.path + " err=" + std::to_string(GetLastError()));
+            continue;
+        }
+        if (job.append)
+        {
+            SetFilePointer(file, 0, nullptr, FILE_END);
+        }
+        DWORD written = 0;
+        WriteFile(file, job.data.data(), static_cast<DWORD>(job.data.size()), &written, nullptr);
+        CloseHandle(file);
+
+        // Confirms everything handed over so far is actually on disk - this,
+        // not "burst recorded", is the signal it's safe to quit.
+        std::lock_guard<std::mutex> lock(g_writeMutex);
+        if (g_writeQueue.empty())
+        {
+            Log("capture: write queue drained - all captured frames are on disk");
+        }
+    }
+}
+
+// Is there room for `bytes` more of queued output? Checked so a frame can be
+// dropped WHOLE rather than per-blob, which produced dumps missing only one
+// artefact with nothing recording which frames were affected.
+bool WriteQueueHasRoom(size_t bytes)
+{
+    std::lock_guard<std::mutex> lock(g_writeMutex);
+    return g_queuedBytes + bytes <= kMaxQueuedBytes;
+}
+
+// Returns false if the job was dropped for backpressure.
+bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = false)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_writeMutex);
+        if (g_writerStop)
+        {
+            return false;
+        }
+        if (!g_writerStarted)
+        {
+            g_writerStarted = true;
+            g_writerThread = std::thread(WriterThread);
+        }
+        // Small bookkeeping writes (metadata, frame index sidecar) always go
+        // through - dropping them loses the ability to interpret the frames
+        // that did make it.
+        if (data.size() > 4096 && g_queuedBytes + data.size() > kMaxQueuedBytes)
+        {
+            const uint64_t n = g_droppedWrites.fetch_add(1) + 1;
+            Log("capture: WRITE QUEUE FULL (" + std::to_string(g_queuedBytes / (1024 * 1024)) +
+                "MB pending), dropping " + path + " - dropped " + std::to_string(n) + " so far");
+            return false;
+        }
+        g_queuedBytes += data.size();
+        g_writeQueue.push_back(WriteJob{std::move(path), std::move(data), append});
+    }
+    g_writeCv.notify_one();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+
+// Creates a READBACK-heap resource of the given size.
+bool CreateReadbackBuffer(ID3D12Device* device, UINT64 bytes, ComPtr<ID3D12Resource>& out)
+{
+    D3D12_HEAP_PROPERTIES heapProps{};
+    heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = bytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    const HRESULT hr = device->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&out));
+    return SUCCEEDED(hr);
+}
+
+// DEFAULT-heap buffer a compute shader can write via root UAV. Needed
+// because READBACK memory isn't GPU-writable except as a copy destination.
+bool CreateDefaultUavBuffer(ID3D12Device* device, UINT64 bytes, ComPtr<ID3D12Resource>& out)
+{
+    D3D12_HEAP_PROPERTIES heapProps{};
+    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = bytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    const HRESULT hr = device->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&out));
+    return SUCCEEDED(hr);
+}
+
+// Plane count for a format (depth/stencil = 2, most others = 1). Subresource
+// count is mips * arraySize * planeCount - getting this wrong silently
+// truncates the copy.
+UINT PlaneCountFor(ID3D12Device* device, DXGI_FORMAT format)
+{
+    D3D12_FEATURE_DATA_FORMAT_INFO info{};
+    info.Format = format;
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, &info, sizeof(info))))
+    {
+        return 1;
+    }
+    return info.PlaneCount == 0 ? 1 : info.PlaneCount;
+}
+
+UINT SubresourceCountFor(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
+{
+    const UINT mips = desc.MipLevels == 0 ? 1 : desc.MipLevels;
+    const UINT slices = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                            ? 1
+                            : (desc.DepthOrArraySize == 0 ? 1 : desc.DepthOrArraySize);
+    return mips * slices * PlaneCountFor(device, desc.Format);
+}
+
+// Copies every subresource of a texture into a READBACK buffer, bracketed by
+// barriers that restore the resource's original state afterward.
+//
+// Footprints are laid out back-to-back in subresource order (as
+// GetCopyableFootprints described them) so offline tools can address any
+// subresource from one file. Derived from the desc rather than assumed, so
+// mipped/arrayed/planar resources (e.g. depth/stencil) are handled correctly
+// rather than truncated to their first plane.
+void RecordCopyToReadback(
+    ID3D12GraphicsCommandList* cmdList,
+    ID3D12Resource* source,
+    ID3D12Resource* dest,
+    const std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>& footprints,
+    D3D12_RESOURCE_STATES stateBefore,
+    ResourceBarrierFn barrierFn)
+{
+    if (footprints.empty())
+    {
+        return;
+    }
+
+    // ALL_SUBRESOURCES transitions every subresource in one barrier - cheaper,
+    // and correct for multi-plane resources that would otherwise need one each.
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.Transition.pResource = source;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = stateBefore;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrierFn(cmdList, 1, &barrier);
+
+    for (UINT i = 0; i < static_cast<UINT>(footprints.size()); ++i)
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = dest;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = footprints[i];
+
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = source;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = i;
+
+        cmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+
+    // Restore - leaving COPY_SOURCE would desync the game's own barrier
+    // bookkeeping and trip the debug layer / corrupt rendering.
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = stateBefore;
+    barrierFn(cmdList, 1, &barrier);
+}
+
+void WriteMetadata(const Slot& slot)
+{
+    // Both formats come from the descs the footprints were derived from, not
+    // hardcoded - a widened identification filter would otherwise mislabel
+    // the dump silently.
+    const DXGI_FORMAT velocityFormat = slot.velocityDesc.Format;
+    const DXGI_FORMAT colorFormat = slot.colorDesc.Format;
+    std::string meta;
+    // Subresource 0 describes the top mip/first plane, which is what offline
+    // tools read. Subresource count is reported too, so multi-plane/mipped
+    // captures are self-describing.
+    meta += "velocity_width=" + std::to_string(slot.velocityFootprints[0].Footprint.Width) + "\n";
+    meta += "velocity_height=" + std::to_string(slot.velocityFootprints[0].Footprint.Height) + "\n";
+    meta += "velocity_row_pitch=" + std::to_string(slot.velocityFootprints[0].Footprint.RowPitch) + "\n";
+    meta += "velocity_format=" + std::to_string(static_cast<int>(velocityFormat)) + "\n";
+    meta += "velocity_bytes=" + std::to_string(slot.velocityBytes) + "\n";
+    meta += "velocity_subresources=" + std::to_string(slot.velocitySubresources) + "\n";
+    meta += "color_width=" + std::to_string(slot.colorFootprints[0].Footprint.Width) + "\n";
+    meta += "color_height=" + std::to_string(slot.colorFootprints[0].Footprint.Height) + "\n";
+    meta += "color_row_pitch=" + std::to_string(slot.colorFootprints[0].Footprint.RowPitch) + "\n";
+    meta += "color_format=" + std::to_string(static_cast<int>(colorFormat)) + "\n";
+    meta += "color_bytes=" + std::to_string(slot.colorBytes) + "\n";
+    meta += "color_subresources=" + std::to_string(slot.colorSubresources) + "\n";
+    // Engine version the dump came from, recorded per capture so the offline
+    // decode doesn't rely on a module-global default (which silently
+    // mis-decodes the second of two dumps in a session). Matters because
+    // 5.7.1 steals bits of channel 3 for bHasPixelAnimation and 5.2 doesn't.
+    //
+    // Operator-supplied via MV_ENGINE_VERSION=5.2; unset stays unset rather
+    // than guessing.
+    {
+        char version[32]{};
+        const DWORD length = GetEnvironmentVariableA("MV_ENGINE_VERSION", version, sizeof(version));
+        if (length > 0 && length < sizeof(version))
+        {
+            const std::string value(version, length);
+            const size_t dot = value.find('.');
+            if (dot != std::string::npos)
+            {
+                meta += "engine_version_major=" + std::to_string(atoi(value.c_str())) + "\n";
+                meta += "engine_version_minor=" + std::to_string(atoi(value.c_str() + dot + 1)) + "\n";
+            }
+            else
+            {
+                Log("capture: MV_ENGINE_VERSION='" + value +
+                    "' is not in major.minor form; not recording it rather than recording a guess");
+            }
+        }
+    }
+    EnqueueWrite(DumpDir() + "meta.txt", std::vector<uint8_t>(meta.begin(), meta.end()));
+    // View constant buffer sidecar header; DrainSlot appends one line per frame.
+    const std::string viewCbHeader = "# captureIndex,slot,gpuVirtualAddress,bindCount,bytes  (slot k starts at k*" +
+                                     std::to_string(kViewCbBytes) + " in viewcb_<captureIndex>.bin)\n";
+    EnqueueWrite(DumpDir() + "viewcb.csv", std::vector<uint8_t>(viewCbHeader.begin(), viewCbHeader.end()));
+    // Truncate the per-frame sidecar so a new session never appends onto the
+    // previous one's indices.
+    const std::string header = "# captureIndex,gameFrameIndex\n";
+    EnqueueWrite(DumpDir() + "frames.csv", std::vector<uint8_t>(header.begin(), header.end()));
+    Log("capture: metadata written - " + meta);
+}
+
+// Depth metadata lives in its own file since meta.txt is written before
+// depth identification can even start (it needs velocity's extent first).
+// A dump without this file is a dump without depth - exactly what it looks
+// like.
+//
+// Every footprint is written, not just subresource 0: D24S8/D32S8 are
+// MULTI-PLANE (depth in plane 0, stencil in plane 1) with different formats
+// and row pitches.
+void WriteDepthMetadata(const Slot& slot)
+{
+    std::string meta;
+    meta += "depth_format=" + std::to_string(static_cast<int>(slot.depthDesc.Format)) + "\n";
+    meta += "depth_bytes=" + std::to_string(slot.depthBytes) + "\n";
+    meta += "depth_subresources=" + std::to_string(slot.depthSubresources) + "\n";
+    for (size_t i = 0; i < slot.depthFootprints.size(); ++i)
+    {
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& f = slot.depthFootprints[i];
+        const std::string prefix = "depth_plane" + std::to_string(i) + "_";
+        meta += prefix + "offset=" + std::to_string(f.Offset) + "\n";
+        meta += prefix + "width=" + std::to_string(f.Footprint.Width) + "\n";
+        meta += prefix + "height=" + std::to_string(f.Footprint.Height) + "\n";
+        meta += prefix + "row_pitch=" + std::to_string(f.Footprint.RowPitch) + "\n";
+        meta += prefix + "format=" + std::to_string(static_cast<int>(f.Footprint.Format)) + "\n";
+    }
+    EnqueueWrite(DumpDir() + "meta_depth.txt", std::vector<uint8_t>(meta.begin(), meta.end()));
+    Log("capture: depth metadata written - " + meta);
+}
+
+void WriteViewCbMetadata()
+{
+    std::string meta;
+    meta += "viewcb_candidates=" + std::to_string(kViewCbCandidates) + "\n";
+    meta += "viewcb_stride=" + std::to_string(kViewCbBytes) + "\n";
+    EnqueueWrite(DumpDir() + "meta_viewcb.txt", std::vector<uint8_t>(meta.begin(), meta.end()));
+}
+
+// Maps one finished readback buffer out to a vector.
+bool MapOut(ID3D12Resource* buffer, UINT64 bytes, std::vector<uint8_t>& out)
+{
+    if (buffer == nullptr || bytes == 0)
+    {
+        return false;
+    }
+    void* mapped = nullptr;
+    D3D12_RANGE readRange{0, static_cast<SIZE_T>(bytes)};
+    if (FAILED(buffer->Map(0, &readRange, &mapped)) || mapped == nullptr)
+    {
+        return false;
+    }
+    out.assign(static_cast<uint8_t*>(mapped), static_cast<uint8_t*>(mapped) + bytes);
+    D3D12_RANGE noWrite{0, 0};
+    buffer->Unmap(0, &noWrite);
+    return true;
+}
+
+// Maps a finished slot's readback buffers and hands their bytes to the
+// writer. All of a frame's artefacts are enqueued together or not at all -
+// per-blob backpressure produced frames missing only depth or only colour
+// with nothing distinguishing that from "never identified".
+bool DrainSlot(Slot& slot)
+{
+    std::vector<uint8_t> velocityData;
+    std::vector<uint8_t> colorData;
+    if (!MapOut(slot.velocityBuffer.Get(), slot.velocityBytes, velocityData) ||
+        !MapOut(slot.colorBuffer.Get(), slot.colorBytes, colorData))
+    {
+        return false;
+    }
+
+    std::vector<uint8_t> depthData;
+    const bool haveDepth = slot.hasDepth && MapOut(slot.depthBuffer.Get(), slot.depthBytes, depthData);
+
+    std::vector<uint8_t> viewCbData;
+    const UINT64 viewCbBytes = static_cast<UINT64>(kViewCbCandidates) * kViewCbBytes;
+    const bool haveViewCb = slot.viewCbCount > 0 && MapOut(slot.viewCbReadback.Get(), viewCbBytes, viewCbData);
+
+    const size_t total = velocityData.size() + colorData.size() + depthData.size() + viewCbData.size();
+    if (!WriteQueueHasRoom(total))
+    {
+        const uint64_t n = g_droppedFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+        Log("capture: write queue has no room for frame " + std::to_string(slot.captureIndex) + " (" +
+            std::to_string(total / (1024 * 1024)) + "MB) - dropping the WHOLE frame, " + std::to_string(n) +
+            " so far. A partial frame would be worse: nothing in the dump distinguishes 'depth was "
+            "dropped here' from 'depth was never captured at all'.");
+        return false;
+    }
+
+    char nameBuf[64]{};
+    sprintf_s(nameBuf, "vel_%05d.bin", slot.captureIndex);
+    const bool velOk = EnqueueWrite(DumpDir() + nameBuf, std::move(velocityData));
+    sprintf_s(nameBuf, "color_%05d.bin", slot.captureIndex);
+    const bool colorOk = EnqueueWrite(DumpDir() + nameBuf, std::move(colorData));
+    if (haveDepth)
+    {
+        sprintf_s(nameBuf, "depth_%05d.bin", slot.captureIndex);
+        EnqueueWrite(DumpDir() + nameBuf, std::move(depthData));
+    }
+    if (haveViewCb)
+    {
+        sprintf_s(nameBuf, "viewcb_%05d.bin", slot.captureIndex);
+        EnqueueWrite(DumpDir() + nameBuf, std::move(viewCbData));
+        std::string lines;
+        for (int i = 0; i < slot.viewCbCount; ++i)
+        {
+            char line[128]{};
+            sprintf_s(
+                line,
+                "%d,%d,%llu,%u,%u\n",
+                slot.captureIndex,
+                i,
+                static_cast<unsigned long long>(slot.viewCbCandidates[i].address),
+                slot.viewCbCandidates[i].bindCount,
+                slot.viewCbCandidates[i].bytes);
+            lines += line;
+        }
+        EnqueueWrite(DumpDir() + "viewcb.csv", std::vector<uint8_t>(lines.begin(), lines.end()), /*append=*/true);
+    }
+
+    // Records which GAME frame this capture came from. Capture indices just
+    // count what we drained, so adjacent indices aren't necessarily adjacent
+    // frames (busy slot, dropped write, second burst) - warp validation needs
+    // N-1/N to actually be one frame apart. Written only when both halves of
+    // the pair made it to disk.
+    if (velOk && colorOk)
+    {
+        char line[64]{};
+        sprintf_s(line, "%d,%llu\n", slot.captureIndex, slot.frameIndex);
+        EnqueueWrite(DumpDir() + "frames.csv", std::vector<uint8_t>(line, line + strlen(line)), /*append=*/true);
+    }
+    return velOk && colorOk;
+}
+
+} // namespace
+
+void SetOriginalFunctions(ResourceBarrierFn resourceBarrier, ExecuteCommandListsFn executeCommandLists)
+{
+    g_originalResourceBarrier = resourceBarrier;
+    g_originalExecuteCommandLists = executeCommandLists;
+}
+
+void NoteCommandQueue(ID3D12CommandQueue* queue)
+{
+    if (queue == nullptr || g_queue != nullptr)
+    {
+        return;
+    }
+    // Only the DIRECT queue is useful: the back-buffer copy must land on the
+    // queue the game renders with, so one fence covers both it and velocity.
+    const D3D12_COMMAND_QUEUE_DESC desc = queue->GetDesc();
+    if (desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_queue == nullptr)
+    {
+        g_queue = queue;
+        Log("capture: noted direct command queue");
+    }
+}
+
+ID3D12CommandQueue* GetGameQueue()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_queue.Get();
+}
+
+void SetFrameIndex(unsigned long long frameIndex)
+{
+    g_frameIndex.store(frameIndex, std::memory_order_relaxed);
+}
+
+void StartCaptureHotkeyThread()
+{
+    if (g_hotkeyThread.joinable())
+    {
+        return;
+    }
+    g_hotkeyThread = std::thread(
+        []
+        {
+            // MV_AUTOCAPTURE exists for testhost's debug-layer harness, which has
+            // no one to press F8. Off unless the env var is set.
+            if (GetEnvironmentVariableA("MV_AUTOCAPTURE", nullptr, 0) != 0)
+            {
+                Sleep(1000);
+                ArmBurst();
+                Log("capture: MV_AUTOCAPTURE set, starting a burst without a keypress");
+            }
+            bool wasDown = false;
+            while (!g_hotkeyStop.load(std::memory_order_relaxed))
+            {
+                const bool isDown = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+                if (isDown && !wasDown && g_framesRemaining.load() == 0)
+                {
+                    ArmBurst();
+                    Log("capture: F8 pressed, capturing " + std::to_string(kCaptureFrames) +
+                        " frames from the next frame boundary");
+                }
+                wasDown = isDown;
+                Sleep(30);
+            }
+        });
+    Log("capture: hotkey thread started (F8 = capture burst)");
+}
+
+namespace
+{
+
+// Caller must hold g_mutex.
+bool EnsureDevice(ID3D12GraphicsCommandList* cmdList)
+{
+    if (g_device != nullptr)
+    {
+        return true;
+    }
+    if (FAILED(cmdList->GetDevice(IID_PPV_ARGS(&g_device))) || g_device == nullptr)
+    {
+        return false;
+    }
+    if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
+    {
+        Log("capture: CreateFence failed");
+        g_device.Reset();
+        return false;
+    }
+    return true;
+}
+
+// The slot this frame's copies go into: the one already recording for this
+// frame, or a fresh one. Either velocity or depth may arrive first (depth
+// transitions out of DEPTH_WRITE before velocity finishes), so whichever
+// arrives first allocates.
+//
+// Caller must hold g_mutex.
+Slot* AcquireSlotForFrame(unsigned long long frame)
+{
+    for (Slot& candidate : g_slots)
+    {
+        if (candidate.state == SlotState::Recording && candidate.frameIndex == frame)
+        {
+            return &candidate;
+        }
+    }
+    for (Slot& candidate : g_slots)
+    {
+        if (candidate.state == SlotState::Free)
+        {
+            candidate.frameIndex = frame;
+            candidate.state = SlotState::Recording;
+            candidate.hasVelocity = false;
+            candidate.hasDepth = false;
+            candidate.depthCopies = 0;
+            candidate.viewCbCount = 0;
+            candidate.recordedList = nullptr;
+            candidate.velocitySubmitted = false;
+            return &candidate;
+        }
+    }
+    return nullptr;
+}
+
+} // namespace
+
+void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velocity, int stateAfter)
+{
+    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || velocity == nullptr)
+    {
+        return;
+    }
+    if (g_originalResourceBarrier == nullptr)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!EnsureDevice(cmdList))
+    {
+        return;
+    }
+
+    const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
+    Slot* slot = AcquireSlotForFrame(frame);
+    // One velocity copy per frame; the buffer transitions twice per frame and
+    // we only want the RENDER_TARGET -> ALL_SHADER_RESOURCE edge.
+    if (slot != nullptr && slot->hasVelocity)
+    {
+        return;
+    }
+    if (slot == nullptr)
+    {
+        // All slots in flight; skip rather than stall. Designed behaviour, but
+        // indistinguishable from a wedged ring without logging - a capture
+        // path that can stop silently and take F8 with it is worse than one
+        // that stalls loudly.
+        const uint64_t misses = g_noFreeSlot.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (misses <= 3 || misses % 240 == 0)
+        {
+            std::string states;
+            for (const Slot& s : g_slots)
+            {
+                states += (states.empty() ? "" : ",");
+                switch (s.state)
+                {
+                    case SlotState::Free:
+                        states += "free";
+                        break;
+                    case SlotState::Recording:
+                        states += "recording@f" + std::to_string(s.frameIndex) + (s.hasVelocity ? "+vel" : "") +
+                                  (s.hasDepth ? "+depth" : "");
+                        break;
+                    case SlotState::Submitted:
+                        states += "submitted@fence" + std::to_string(s.fenceValue);
+                        break;
+                }
+            }
+            Log("capture: no free slot (" + std::to_string(misses) + " skipped so far, " +
+                std::to_string(g_framesRemaining.load(std::memory_order_relaxed)) +
+                " frames still requested) - slots=[" + states +
+                "] fenceCompleted=" + std::to_string(g_fence != nullptr ? g_fence->GetCompletedValue() : 0) +
+                " nextFence=" + std::to_string(g_nextFenceValue));
+        }
+        return;
+    }
+
+    // Footprints only valid for the exact layout derived from, so the desc is
+    // compared every frame rather than trusted once. Render resolution can
+    // change mid-session (dynamic resolution scaling); stale footprints would
+    // silently corrupt the copy into plausible-looking garbage.
+    const D3D12_RESOURCE_DESC desc = velocity->GetDesc();
+    if (slot->velocityBuffer == nullptr || !SameLayout(slot->velocityDesc, desc))
+    {
+        if (slot->velocityBuffer != nullptr)
+        {
+            Log("capture: velocity layout changed, " + DescToString(slot->velocityDesc) + " -> " + DescToString(desc) +
+                "; rebuilding footprints. Identification is re-run when this "
+                "happens (see ReopenIdentification), so the resource is re-found rather than lost "
+                "for the rest of the session as it was before.");
+        }
+        const UINT subresources = SubresourceCountFor(g_device.Get(), desc);
+        slot->velocityFootprints.resize(subresources);
+        UINT64 total = 0;
+        g_device->GetCopyableFootprints(
+            &desc, 0, subresources, 0, slot->velocityFootprints.data(), nullptr, nullptr, &total);
+        slot->velocityBytes = total;
+        slot->velocitySubresources = subresources;
+        slot->velocityDesc = desc;
+        slot->velocityBuffer.Reset();
+        if (!CreateReadbackBuffer(g_device.Get(), total, slot->velocityBuffer))
+        {
+            Log("capture: failed to create velocity readback buffer");
+            return;
+        }
+        Log("capture: velocity readback buffer created, " + std::to_string(total) + " bytes, " +
+            std::to_string(subresources) +
+            " subresource(s), rowPitch=" + std::to_string(slot->velocityFootprints[0].Footprint.RowPitch));
+    }
+
+    RecordCopyToReadback(
+        cmdList,
+        velocity,
+        slot->velocityBuffer.Get(),
+        slot->velocityFootprints,
+        static_cast<D3D12_RESOURCE_STATES>(stateAfter),
+        g_originalResourceBarrier);
+
+    // Remember which command list this copy went onto so fence coverage can
+    // be checked, not assumed (see NoteSubmission). Stored as COM identity,
+    // not the raw interface pointer (see ComIdentity).
+    slot->recordedList = ComIdentity(cmdList);
+    slot->velocitySubmitted = false;
+    slot->queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
+    // Take this frame's root-CBV bind counts HERE rather than at Present.
+    //
+    // At Present, the counting window is "everything since the last Present" -
+    // only one frame's command stream if the game never starts recording the
+    // next frame before presenting. UE5 sometimes does, and a window that
+    // straddles the boundary can pick up the NEXT frame's View buffer, which
+    // anti-correlates velocity against the wrong frame's ClipToPrevClip.
+    //
+    // The velocity buffer's RENDER_TARGET -> shader-resource edge sits inside
+    // frame N's command stream, after every draw that binds its View buffer -
+    // snapshotting here ties the two together by construction.
+    slot->viewCbCount = ViewCbTakeCandidates(slot->viewCbCandidates, kViewCbCandidates);
+    slot->hasVelocity = true;
+}
+
+void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, int stateAfter)
+{
+    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || cmdList == nullptr || depth == nullptr)
+    {
+        return;
+    }
+    if (!DepthCaptureEnabled())
+    {
+        return;
+    }
+    if (g_originalResourceBarrier == nullptr)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (!EnsureDevice(cmdList))
+    {
+        return;
+    }
+
+    const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
+    Slot* slot = AcquireSlotForFrame(frame);
+    if (slot == nullptr || slot->depthCopies >= kMaxDepthCopiesPerFrame)
+    {
+        // No slot free means this frame is being skipped anyway; the velocity
+        // path logs that case in detail and there is nothing to add here.
+        return;
+    }
+    if (slot->hasVelocity && slot->depthCopies > 0)
+    {
+        // Stop once velocity has been recorded, so the dump gets the LAST
+        // depth edge BEFORE velocity became readable - the depth the frame's
+        // velocity was rendered against. Also caps bandwidth: depth copies
+        // can be the bulk of per-frame write volume.
+        //
+        // The `depthCopies > 0` half is a fallback for titles where depth
+        // becomes readable AFTER velocity (frame graph ordered differently
+        // than UE5's default prepass/base-pass) - without it such a title
+        // would silently capture no depth at all.
+        return;
+    }
+    if (slot->hasVelocity && !g_depthAfterVelocityReported.exchange(true))
+    {
+        Log("capture: this title's depth buffer becomes readable only AFTER the velocity buffer "
+            "does, so the depth in the dump is from a pass that ran after velocity was finished. "
+            "For opaque geometry that is the same depth; if this title writes depth after its "
+            "velocity pass, it is not.");
+    }
+
+    const D3D12_RESOURCE_DESC desc = depth->GetDesc();
+    if (slot->depthBuffer == nullptr || !SameLayout(slot->depthDesc, desc))
+    {
+        if (slot->depthBuffer != nullptr)
+        {
+            Log("capture: depth layout changed, " + DescToString(slot->depthDesc) + " -> " + DescToString(desc) +
+                "; rebuilding footprints");
+        }
+        const UINT subresources = SubresourceCountFor(g_device.Get(), desc);
+        slot->depthFootprints.resize(subresources);
+        UINT64 total = 0;
+        g_device->GetCopyableFootprints(
+            &desc, 0, subresources, 0, slot->depthFootprints.data(), nullptr, nullptr, &total);
+        slot->depthBytes = total;
+        slot->depthSubresources = subresources;
+        slot->depthDesc = desc;
+        slot->depthBuffer.Reset();
+        if (!CreateReadbackBuffer(g_device.Get(), total, slot->depthBuffer))
+        {
+            Log("capture: failed to create depth readback buffer");
+            return;
+        }
+        Log("capture: depth readback buffer created, " + std::to_string(total) + " bytes, " +
+            std::to_string(subresources) +
+            " subresource(s) (plane count comes from the desc: a D24S8 or "
+            "D32S8 depth buffer is two planes, and copying only the first would silently truncate it)");
+        if (!g_depthMetadataWritten.exchange(true))
+        {
+            WriteDepthMetadata(*slot);
+        }
+    }
+
+    RecordCopyToReadback(
+        cmdList,
+        depth,
+        slot->depthBuffer.Get(),
+        slot->depthFootprints,
+        static_cast<D3D12_RESOURCE_STATES>(stateAfter),
+        g_originalResourceBarrier);
+    ++slot->depthCopies;
+    slot->hasDepth = true;
+
+    // Depth edge count per frame depends on the title's frame graph (full
+    // prepass = 1, partial prepass = 2); "last one wins" only means what it
+    // says if this is observed rather than assumed. Logged sparingly.
+    const uint64_t seen = g_depthEdgeReports.fetch_add(1, std::memory_order_relaxed);
+    if (seen < 8)
+    {
+        Log("capture: depth copy " + std::to_string(slot->depthCopies) + " of frame " + std::to_string(frame) +
+            " recorded (stateAfter=" + std::to_string(stateAfter) +
+            "). The last copy of a frame is the one that lands in the dump.");
+    }
+}
+
+void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12CommandList* const* commandLists)
+{
+    // Cheap early-out: runs on the render thread for every submission; nothing
+    // to check outside a capture burst.
+    if (g_framesRemaining.load(std::memory_order_relaxed) <= 0 || commandLists == nullptr)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (queue == g_queue.Get())
+    {
+        g_queueSubmissions.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (Slot& slot : g_slots)
+    {
+        if (slot.state != SlotState::Recording || slot.recordedList == nullptr)
+        {
+            continue;
+        }
+        for (UINT i = 0; i < numCommandLists; ++i)
+        {
+            if (ComIdentity(commandLists[i]) != slot.recordedList)
+            {
+                continue;
+            }
+            if (queue == g_queue.Get())
+            {
+                slot.velocitySubmitted = true;
+            }
+            else
+            {
+                // Readback correctness rests on one fence covering both our
+                // copy and the velocity copy, which only holds if velocity
+                // was submitted to the same queue. A second DIRECT queue
+                // would silently produce stale reads.
+                Log("capture: WARNING velocity command list submitted on a queue other than the "
+                    "one we fence on - readback for frame " +
+                    std::to_string(slot.frameIndex) + " is NOT covered by our fence");
+            }
+        }
+    }
+}
+
+void OnPresent(IDXGISwapChain* swapChain)
+{
+    if (swapChain == nullptr || g_originalExecuteCommandLists == nullptr)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    // 0. Take (and clear) whatever root-CBV binds are left over from this frame.
+    //
+    // The counts that matter are taken at the velocity barrier
+    // (OnVelocityReadable); this is only a fallback. Must clear every frame
+    // regardless: UE5 recycles constant-buffer addresses, so a stale one is
+    // memory read through an unbounded root descriptor, not just old data.
+    ViewCbCandidate frameCandidates[kViewCbCandidates]{};
+    const int frameCandidateCount = ViewCbTakeCandidates(frameCandidates, kViewCbCandidates);
+
+    // An armed burst begins here, at a frame boundary, so the first captured
+    // frame is one whose recording was watched from the start.
+    if (g_burstArmed.exchange(false, std::memory_order_relaxed))
+    {
+        g_framesRemaining.store(kCaptureFrames);
+        g_burstPresentsLeft.store(kBurstPresentBudget);
+    }
+
+    // End the burst if the game has stopped rendering the velocity pass -
+    // otherwise a run that ends right after F8 spends its whole Present
+    // budget silently waiting for frames that will never come.
+    {
+        const unsigned long long presented = g_frameIndex.load(std::memory_order_relaxed);
+        uint64_t silentFor = 0;
+        if (g_framesRemaining.load(std::memory_order_relaxed) > 0 && VelocityPassIsSilent(presented, &silentFor))
+        {
+            const int short_by = g_framesRemaining.exchange(0, std::memory_order_relaxed);
+            ViewCbSetTracking(false);
+            Log("capture: burst ENDED - the game has not rendered the velocity pass for " + std::to_string(silentFor) +
+                " frames, so there is nothing left to capture. " + std::to_string(short_by) + " of the requested " +
+                std::to_string(kCaptureFrames) +
+                " never landed and will not; press F8 again once you are back in gameplay. This is "
+                "the game's state, not a fault in the capture path - see the 'velocity pass has "
+                "STOPPED' line above.");
+        }
+    }
+
+    // Spend one of the burst's Presents, whatever this frame turns out to
+    // produce, and end the burst if it has run out of them.
+    if (g_framesRemaining.load(std::memory_order_relaxed) > 0 &&
+        g_burstPresentsLeft.fetch_sub(1, std::memory_order_relaxed) <= 1)
+    {
+        const int short_by = g_framesRemaining.exchange(0, std::memory_order_relaxed);
+        ViewCbSetTracking(false);
+        Log("capture: burst ENDED short - " + std::to_string(kBurstPresentBudget) + " frames presented and " +
+            std::to_string(short_by) + " of the requested " + std::to_string(kCaptureFrames) +
+            " never landed. The dump has what did. Ending rather than waiting: a burst that "
+            "cannot complete also holds the F8 hotkey down for the rest of the session. Check the "
+            "'no free slot' and 'WRITE QUEUE FULL' counts above for which limit was hit.");
+    }
+
+    // 1. Drain any slots whose GPU work has completed.
+    if (g_fence != nullptr)
+    {
+        const UINT64 completed = g_fence->GetCompletedValue();
+        for (Slot& slot : g_slots)
+        {
+            if (slot.state == SlotState::Submitted && completed >= slot.fenceValue)
+            {
+                DrainSlot(slot);
+                slot.state = SlotState::Free;
+            }
+        }
+    }
+
+    // 2. Reclaim slots whose Present never arrived (abandoned frame,
+    // resolution change, failed QueryInterface below). Four stranded slots
+    // and capture stops silently and permanently.
+    const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
+    for (Slot& candidate : g_slots)
+    {
+        if (candidate.state == SlotState::Recording && candidate.frameIndex + kSlotStaleAfterFrames < frame)
+        {
+            Log("capture: reclaiming stale slot from frame " + std::to_string(candidate.frameIndex) +
+                " (never paired with a Present; now at frame " + std::to_string(frame) + ")");
+            candidate.recordedList = nullptr;
+            candidate.state = SlotState::Free;
+        }
+    }
+
+    // 3. Pair this frame's velocity copy with the finished back buffer.
+    Slot* slot = nullptr;
+    for (Slot& candidate : g_slots)
+    {
+        if (candidate.state == SlotState::Recording && candidate.frameIndex == frame)
+        {
+            slot = &candidate;
+            break;
+        }
+    }
+    if (slot == nullptr || g_device == nullptr || g_queue == nullptr)
+    {
+        return;
+    }
+    if (!slot->hasVelocity)
+    {
+        // Depth (or nothing) arrived but velocity did not. Every downstream
+        // tool keys off velocity, so a frame without it isn't a capture -
+        // release the slot rather than emit a half-frame.
+        const uint64_t n = g_framesWithoutVelocity.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 3 || n % 60 == 0)
+        {
+            Log("capture: frame " + std::to_string(frame) + " had no velocity copy (" + std::to_string(n) +
+                " such frames so far). Releasing the slot; nothing is written for this frame.");
+        }
+        slot->recordedList = nullptr;
+        slot->state = SlotState::Free;
+        return;
+    }
+    if (slot->viewCbCount == 0 && frameCandidateCount > 0)
+    {
+        // Nothing was bound by the time the velocity edge arrived - fall back
+        // to what was bound over the whole Present interval. Weaker (can
+        // straddle a frame boundary, the same pairing error the snapshot was
+        // moved off Present to avoid), but beats capturing nothing for a
+        // title that binds its View buffer after the velocity pass.
+        slot->viewCbCount = frameCandidateCount;
+        for (int i = 0; i < frameCandidateCount; ++i)
+        {
+            slot->viewCbCandidates[i] = frameCandidates[i];
+        }
+        if (!g_viewCbFallbackReported.exchange(true))
+        {
+            Log("capture: no root constant buffer had been bound by the time the velocity buffer became "
+                "readable, so the View buffer is being sampled over the whole Present interval instead. "
+                "That interval can straddle a frame boundary; treat per-frame agreement in the offline "
+                "reprojection as the check on whether it did.");
+        }
+    }
+
+    // Every captured frame must carry every artefact this session can produce.
+    //
+    // Partial frames cluster at burst edges: F8 arrives mid-frame, after
+    // depth edges but before the velocity edge, or CBV tracking switches on
+    // mid-frame after the View-buffer binds. Dropping those beats keeping
+    // them - a dump with inconsistent frames forces every offline tool to
+    // special-case it, and getting that wrong means comparing against the
+    // wrong frame silently.
+    //
+    // Each condition gates on the artefact having been produced at least
+    // once, so a title that never identifies depth or never binds a CBV
+    // still captures velocity rather than nothing.
+    const char* missing = nullptr;
+    if (!slot->hasDepth && DepthCaptureEnabled() && IdentifiedDepthResource() != nullptr)
+    {
+        missing = "depth";
+    }
+    else if (slot->viewCbCount == 0 && g_viewCbEverSeen.load(std::memory_order_relaxed))
+    {
+        missing = "the View constant buffer";
+    }
+    if (missing != nullptr)
+    {
+        const uint64_t n = g_incompleteFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 3)
+        {
+            Log("capture: frame " + std::to_string(frame) + " has velocity but not " + missing +
+                " (a burst usually starts mid-frame). Dropping it so the dump stays homogeneous - " +
+                std::to_string(n) + " so far.");
+        }
+        slot->recordedList = nullptr;
+        slot->state = SlotState::Free;
+        return;
+    }
+
+    ComPtr<IDXGISwapChain3> swapChain3;
+    if (FAILED(swapChain->QueryInterface(IID_PPV_ARGS(&swapChain3))))
+    {
+        return;
+    }
+    ComPtr<ID3D12Resource> backBuffer;
+    const UINT backBufferIndex = swapChain3->GetCurrentBackBufferIndex();
+    // GetBuffer AddRefs (unlike view-creation calls), so holding this pointer
+    // is safe.
+    if (FAILED(swapChain3->GetBuffer(backBufferIndex, IID_PPV_ARGS(&backBuffer))) || backBuffer == nullptr)
+    {
+        return;
+    }
+
+    // Same every-frame revalidation as velocity: a resize or fullscreen
+    // transition recreates swapchain buffers at a new size, and stale
+    // footprints would corrupt silently.
+    const D3D12_RESOURCE_DESC desc = backBuffer->GetDesc();
+    if (slot->colorBuffer == nullptr || !SameLayout(slot->colorDesc, desc))
+    {
+        if (slot->colorBuffer != nullptr)
+        {
+            Log("capture: back buffer layout changed, " + DescToString(slot->colorDesc) + " -> " + DescToString(desc) +
+                "; rebuilding footprints");
+        }
+        const UINT subresources = SubresourceCountFor(g_device.Get(), desc);
+        slot->colorFootprints.resize(subresources);
+        UINT64 total = 0;
+        g_device->GetCopyableFootprints(
+            &desc, 0, subresources, 0, slot->colorFootprints.data(), nullptr, nullptr, &total);
+        slot->colorBytes = total;
+        slot->colorSubresources = subresources;
+        slot->colorDesc = desc;
+        slot->colorBuffer.Reset();
+        if (!CreateReadbackBuffer(g_device.Get(), total, slot->colorBuffer))
+        {
+            Log("capture: failed to create colour readback buffer");
+            return;
+        }
+        if (!g_metadataWritten.exchange(true))
+        {
+            WriteMetadata(*slot);
+        }
+    }
+
+    // The fence signalled below covers the velocity copy only if the game has
+    // already submitted the list it was recorded onto. NoteSubmission checks
+    // this rather than assuming it, so an unmet case is reported instead of
+    // silently producing a stale readback.
+    if (slot->velocitySubmitted)
+    {
+        g_coverageStrong.fetch_add(1, std::memory_order_relaxed);
+    }
+    else if (g_queueSubmissions.load(std::memory_order_relaxed) > slot->queueSubmissionsAtRecord)
+    {
+        g_coverageWeak.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        g_coverageNone.fetch_add(1, std::memory_order_relaxed);
+        Log("capture: WARNING frame " + std::to_string(frame) +
+            " - nothing was submitted to the queue we fence on between recording the velocity copy "
+            "and this Present, so the fence below cannot cover it. This frame's velocity readback "
+            "is unsafe.");
+    }
+
+    if (slot->allocator == nullptr)
+    {
+        if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot->allocator))))
+        {
+            return;
+        }
+        if (FAILED(g_device->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot->allocator.Get(), nullptr, IID_PPV_ARGS(&slot->commandList))))
+        {
+            return;
+        }
+        slot->commandList->Close();
+    }
+
+    if (FAILED(slot->allocator->Reset()) || FAILED(slot->commandList->Reset(slot->allocator.Get(), nullptr)))
+    {
+        return;
+    }
+
+    // The back buffer is in PRESENT state here (== COMMON), since the game has
+    // finished with it and is about to present.
+    RecordCopyToReadback(
+        slot->commandList.Get(),
+        backBuffer.Get(),
+        slot->colorBuffer.Get(),
+        slot->colorFootprints,
+        D3D12_RESOURCE_STATE_PRESENT,
+        g_originalResourceBarrier);
+
+    // The View constant buffer, read straight off the GPU addresses bound
+    // this frame. Recorded on OUR command list on purpose: setting a compute
+    // root signature/PSO on a list the game is still recording into would
+    // corrupt its next draws.
+    if (slot->viewCbCount > 0)
+    {
+        const UINT64 viewCbBytes = static_cast<UINT64>(kViewCbCandidates) * kViewCbBytes;
+        if (slot->viewCbUav == nullptr && !CreateDefaultUavBuffer(g_device.Get(), viewCbBytes, slot->viewCbUav))
+        {
+            Log("capture: failed to create the View constant buffer UAV; continuing without it");
+            slot->viewCbCount = 0;
+        }
+        if (slot->viewCbCount > 0 && slot->viewCbReadback == nullptr &&
+            !CreateReadbackBuffer(g_device.Get(), viewCbBytes, slot->viewCbReadback))
+        {
+            Log("capture: failed to create the View constant buffer readback; continuing without it");
+            slot->viewCbCount = 0;
+        }
+        if (slot->viewCbCount > 0 && !ViewCbRecordCopies(
+                                         g_device.Get(),
+                                         slot->commandList.Get(),
+                                         slot->viewCbUav.Get(),
+                                         slot->viewCbReadback.Get(),
+                                         slot->viewCbCandidates,
+                                         slot->viewCbCount,
+                                         g_originalResourceBarrier))
+        {
+            slot->viewCbCount = 0;
+        }
+        if (slot->viewCbCount > 0)
+        {
+            g_viewCbEverSeen.store(true, std::memory_order_relaxed);
+            if (!g_viewCbMetadataWritten.exchange(true))
+            {
+                WriteViewCbMetadata();
+            }
+        }
+    }
+
+    if (FAILED(slot->commandList->Close()))
+    {
+        return;
+    }
+
+    ID3D12CommandList* lists[] = {slot->commandList.Get()};
+    g_originalExecuteCommandLists(g_queue.Get(), 1, lists);
+
+    slot->fenceValue = g_nextFenceValue++;
+    if (FAILED(g_queue->Signal(g_fence.Get(), slot->fenceValue)))
+    {
+        return;
+    }
+
+    slot->captureIndex = g_captureCounter.fetch_add(1);
+    slot->recordedList = nullptr;
+    slot->state = SlotState::Submitted;
+
+    const int remaining = g_framesRemaining.fetch_sub(1) - 1;
+    if (remaining <= 0)
+    {
+        ViewCbSetTracking(false);
+        // "Recorded" is the honest word: last frames may still be in flight
+        // on the GPU, and drained frames are only queued for the writer, not
+        // necessarily on disk yet. Only ShutdownCapture guarantees that.
+        Log("capture: burst recorded, " + std::to_string(g_captureCounter.load()) + " frames; writes still draining (" +
+            std::to_string(g_droppedWrites.load()) + " dropped)");
+        Log("capture: fence coverage - " + std::to_string(g_coverageStrong.load()) +
+            " frames verified by command-list identity, " + std::to_string(g_coverageWeak.load()) +
+            " consistent-but-unproven (identity not observable), " + std::to_string(g_coverageNone.load()) +
+            " UNSAFE. Only the first category is proof the readback is not stale.");
+    }
+}
+
+void StopCaptureHotkeyThread(bool processExiting)
+{
+    g_hotkeyStop.store(true, std::memory_order_relaxed);
+    if (!g_hotkeyThread.joinable())
+    {
+        return;
+    }
+    if (processExiting)
+    {
+        // Detach rather than join. By DLL_PROCESS_DETACH, Windows has already
+        // terminated every other thread, so there's nothing to wait for - but
+        // a still-joinable std::thread destructor calls std::terminate(), and
+        // this is a file-scope object whose destructor runs during CRT
+        // teardown next.
+        g_hotkeyThread.detach();
+    }
+    else
+    {
+        // The loop's longest wait is a 30ms Sleep, so this returns promptly,
+        // and neither GetAsyncKeyState nor Sleep needs the loader lock that may
+        // be held while this runs.
+        g_hotkeyThread.join();
+    }
+}
+
+void ShutdownCapture(bool processExiting)
+{
+    // On a live flush (processExiting == false, from MvFlushCapture) the
+    // queue is drained and the thread joined. On process exit it can't be:
+    // by DLL_PROCESS_DETACH, Windows has already terminated every other
+    // thread, so the writer is gone regardless and joining would only
+    // confirm that.
+    //
+    // The real guarantee is the "write queue drained" line the writer emits
+    // when empty - that, not "burst recorded", means it's safe to close the
+    // game (documented in README).
+    StopCaptureHotkeyThread(processExiting);
+
+    std::thread writer;
+    {
+        std::lock_guard<std::mutex> lock(g_writeMutex);
+        if (!g_writerStarted)
+        {
+            return;
+        }
+        g_writerStop = true;
+        if (processExiting)
+        {
+            const size_t pending = g_writeQueue.size();
+            if (pending > 0)
+            {
+                Log("capture: process exiting with " + std::to_string(pending) +
+                    " writes still queued - those frames are LOST. Wait for "
+                    "'write queue drained' before quitting.");
+            }
+            if (g_writerThread.joinable())
+            {
+                g_writerThread.detach(); // same argument as the hotkey thread above
+            }
+            return;
+        }
+        writer = std::move(g_writerThread);
+    }
+    g_writeCv.notify_all();
+    if (writer.joinable())
+    {
+        writer.join();
+    }
+    Log("capture: writer drained and stopped");
+}
+
+} // namespace mv
