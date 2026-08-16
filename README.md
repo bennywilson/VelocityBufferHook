@@ -14,6 +14,8 @@ the Oxi work made about SceneVelocity.
 
 Full detail is kept in `DEBUGGING.md`.
 
+Output of verification tests can be found in `results/` (see below for more)
+
 ## Build and run
 
 ```
@@ -21,30 +23,15 @@ cmake -B build -S .
 cmake --build build --config Release --target mv_hook mv_injector mv_testhost
 ```
 
-One command launches the game and injects, handling the startup ordering:
-- env vars must be set before launch to be inherited
-- must wait for the real `*-Win64-Shipping` child rather than a launcher stub,
-- must not inject on top of an already-loaded copy
-- etc
-
 ```powershell
-.\Invoke-MvCapture.ps1 "D:\Games\Skyrunner\Valfreyja.exe"
-.\Invoke-MvCapture.ps1 "D:\Games\Skyrunner\Valfreyja.exe" -DumpDir D:\mv_captures\run7
+.\Invoke-MvCapture.ps1 "D:\Games\Skyrunner\Valfreya.exe"
+.\Invoke-MvCapture.ps1 "D:\Games\Skyrunner\Valfreya.exe" -DumpDir D:\mv_captures\run7
 ```
 
-Useful flags: `-DryRun` (do everything except inject), `-DumpDir`,
-`-EngineVersion` (inferred for the titles in this repo, required otherwise —
-5.2 and 5.7 pack channels 2/3 differently), `-AttachOnly` (inject into an
-already-running process).
-
-Key environment variables, if driving it by hand instead:
-
-| variable | effect |
-|---|---|
-| `MV_DUMP_DIR` | where captures are written |
-| `MV_ENGINE_VERSION` | e.g. `5.2` — needed by the offline decode for channels 2/3 |
-| `MV_IDENTIFY_FRAMES` | frames to watch barriers before deciding (default 90) |
-| `MV_CAPTURE_DEPTH=0` | disable the depth copy for a session |
+`Valfreya.exe` is the launcher — pass that path in. The script itself waits
+for and injects into the real renderer process it spawns,
+`Skyrunner-Win64-Shipping.exe`, the same way it does for Oxi's own
+`*-Win64-Shipping.exe` child.
 
 With the game running, **F8** captures a 60-frame burst to `%TEMP%\mv_dump\`
 (or `MV_DUMP_DIR`). Wait for `capture: write queue drained` in
@@ -68,28 +55,63 @@ set MV_DUMP_DIR=%TEMP%\mv_dump_testhost
 build\testhost\Release\mv_testhost.exe --hook <abs path>\build\hook\Release\mv_hook.dll --frames 240
 ```
 
-Practical notes: inject into `*-Win64-Shipping.exe`, not the launcher stub;
-wait ~5s after process start before injecting; restart the game rather than
-re-injecting a rebuilt DLL over a loaded one; capture the shipping build in
-RenderDoc, not PIE/editor (resolutions differ between them).
+## Results
+
+Everything below is already in `results/` and reproducible without a running
+game — `results/validation_*.txt` is generated verbatim by
+`run_validation.py` against capture dumps kept outside the repo (raw dumps
+are large and gitignored), and `mv_testhost` needs nothing but the built DLL.
+Re-running both against the same inputs reproduces every number here exactly.
+
+![full-screen field, Skyrunner](results/motion_field_dense_skyrunner_video.png)
+
+Left: the game's own back buffer. Middle: `SceneVelocity` as written by the
+engine — dynamic/WPO objects only, correctly sparse. Right: the same frame
+with the black pixels filled in by reprojecting depth through
+`View_ClipToPrevClip`. Video: `results/motion_field_dense_skyrunner_video.mp4`.
+
+| test | result | source |
+|---|---|---|
+| identification, third-party title | 1 of 755 profiled resources, 3 separate injections, confirmed against RenderDoc's `CreatePlacedResource` call | `results/validation_skyrunner*.txt` |
+| `mv_testhost` debug-layer harness | 0 errors over 240 hooked frames, correct resource picked out of 4 structural look-alikes every run; refuses to pick between 2 indistinguishable candidates when told to | run directly, no game needed |
+| warp-and-difference, 120-frame capture | 102/103 pairs improved, +37.7% mean error reduction, beats the best possible rigid shift by 59.9% | `results/validation_skyrunner.txt`, `results/warp_validation_skyrunner.png` |
+| warp-and-difference, 60-frame capture (video above) | 47/47 pairs improved, +53.6% mean error reduction | `results/validation_skyrunner_video.txt` |
+| decode vs. analytical reprojection (no image matching involved) | slope 1.0000 / 0.9997, r = 1.0000 / 0.9998, over 18,076,704 pixels | `results/validation_skyrunner_video.txt` |
+| decode vs. block-matched image motion | corr X +0.99, Y +0.94; engine decode beats a linear decode by ~4-6px RMS | `results/decode_scatter_skyrunner*.png` |
+
+To check any of these yourself:
+
+```
+build\testhost\Release\mv_testhost.exe --hook <path>\mv_hook.dll --frames 240
+cd tools && python run_validation.py <dump_dir> <title>   # writes results/validation_<title>.txt
+```
+
+The full debugging narrative behind these numbers — including the wrong
+turns, the format-enum bug, and the properties of Oxi's velocity buffer that
+turned out not to generalise to Skyrunner — is in `DEBUGGING.md`.
 
 ## How it works
 
 **Identification.** Neither a pure descriptor match nor pure runtime behaviour
-transfers between titles, so the two are used as separate tools. Structure is
-a hard gate derived from engine rules rather than a copied tuple: the formats
-`FVelocityRendering::GetFormat` can return, the create flags
-`GetCreateFlags` implies, `mips=1/arraySize=1/samples=1/layout=UNKNOWN`, and a
-resolution ranked (not matched) from an observed histogram, bounded above by
-the back buffer. Behaviour — barrier transition patterns over a settling
-window — is scored evidence layered on top, logged per candidate with a reason
-for the winner. On Oxi, behaviour was decisive and format broke a tie; on
-Skyrunner, structure alone was already unique and most of the "invariants"
-measured on Oxi (exactly 2 barrier events/frame, never entering
-`UNORDERED_ACCESS`, destination state `ALL_SHADER_RESOURCE`) turned out false
-of Skyrunner's own velocity buffer. Where the ranking can't separate
-candidates by a clear margin, the hook refuses to capture rather than
-guessing.
+transfers between titles, so the two are used as separate tools:
+
+- **Structure** is a hard gate derived from engine rules rather than a copied
+  tuple: the formats `FVelocityRendering::GetFormat` can return, the create
+  flags `GetCreateFlags` implies, `mips=1/arraySize=1/samples=1/layout=UNKNOWN`,
+  and a resolution ranked (not matched) from an observed histogram, bounded at
+  up to 2x the back buffer per dimension rather than capped at it — UE rounds
+  render targets up, so the velocity buffer is routinely *larger* than the back
+  buffer which an early version of the filter missed.
+- **Behaviour** — barrier transition patterns over a settling window — is
+  scored evidence layered on top of the structural gate, logged per candidate
+  with a reason for the winner.
+
+On Oxi, behaviour was decisive and structure only broke a tie; on Skyrunner,
+structure alone was already unique and most of the "invariants" measured on
+Oxi (exactly 2 barrier events/frame, never entering `UNORDERED_ACCESS`,
+destination state `ALL_SHADER_RESOURCE`) turned out false of Skyrunner's own
+velocity buffer. The capture deliberately fails on frames where the ranking 
+can't separate candidates by a clear margin.
 
 **Extraction.** The buffer is a *transient placed* resource whose heap memory
 gets aliased by other resources later in the frame, so it can only be safely
@@ -145,16 +167,16 @@ different reasons:
   depth, ~23% from the buffer itself, the far plane left as no-data rather
   than a fabricated number).
 
-**Debugging ethic.** Two rules run through the whole log: re-derive constants
+**Debugging** Two rules run through the whole log: re-derive constants
 from primary sources instead of trusting recalled or fitted values, and leave
 wrong turns in the record instead of editing them out once the right answer is
 known. Two concrete cases:
 - The velocity buffer's format was transcribed early on as
   `R16G16B16A16_FLOAT` (DXGI enum 10) instead of the actual `_UNORM` (11). The
-  wrong filter didn't fail loudly — it matched a real pool of 4 HDR render
+  wrong filter didn't fail loudly as it matched a real pool of 4 HDR render
   targets that cycled states exactly like a velocity buffer would, so three
   separate rounds of otherwise-correct analysis ran against the wrong
-  candidate set before anyone re-checked the constant against `dxgiformat.h`.
+  candidate set before we re-checked the constant against `dxgiformat.h`.
   The tell, in hindsight, was that all 4 survivors were descriptor-identical —
   the signature of a pool, not a specific resource.
 - Porting to Skyrunner falsified properties the Oxi barrier survey had
@@ -167,17 +189,32 @@ known. Two concrete cases:
   which is why identification now treats structure as the only hard gate and
   behaviour as scored evidence rather than a second set of invariants.
 
-**Where AI helped, and where it was overridden.** Useful for well-specified
-boilerplate — the D3D12 bootstrap to obtain vtable pointers, readback/fence
-plumbing, the ring-buffer/writer-thread structure, Python decode/plot code —
-and for bulk log analysis (grouping ~1M barrier events by transition pattern).
-Unreliable, and overridden, on anything that was a specific numeric claim
-about the engine: recalled `D3D12_RESOURCE_STATES` values that were simply
-wrong and caught only by checking `d3d12.h`; a recollection of the velocity
-decode constants that quietly omitted the `sqrt` term, discovered by reading
-the actual shader source rather than trusting the recollection; and a fence
-"coverage" check that compared raw COM interface pointers, which the debug
-layer falsified on its first run because it wraps interfaces at a different
-address per hook site. The pattern was consistent: reliable for structure and
-throughput, unreliable for specific facts, and those are exactly the things
-that fail silently and plausibly rather than loudly.
+**Where AI helped, and where it was overridden.**
+
+- **Helped:** well-specified boilerplate — the D3D12 bootstrap to obtain
+  vtable pointers, readback/fence plumbing, the ring-buffer/writer-thread
+  structure, Python decode/plot code — plus bulk log analysis (grouping ~1M
+  barrier events by transition pattern).
+- **Overridden:** anything that was a specific numeric claim about the
+  engine. Recalled `D3D12_RESOURCE_STATES` values that were simply wrong,
+  caught only by checking `d3d12.h`. A recollection of the velocity decode
+  constants that quietly omitted the `sqrt` term, caught by reading the
+  actual shader source rather than trusting the recollection. A fence
+  "coverage" check that compared raw COM interface pointers, falsified by the
+  debug layer on its first run because it wraps interfaces at a different
+  address per hook site.
+- **Wrong diagnoses, not just wrong numbers.** A few times a plausible-sounding
+  root cause for an observed bug turned out to be false and had to be caught
+  by evidence rather than argument — e.g. a live overlay that appeared to
+  freeze on certain frames while the game kept running was first attributed to
+  the engine skipping the velocity pass when nothing in view has non-camera
+  motion to write; a screenshot showing WPO-animated foliage filling half the
+  frame while the overlay was already stale ruled that out immediately. The
+  real cause, found afterward, was unrelated. `DEBUGGING.md` has more of
+  these, including one case where the correct diagnosis was reached, then
+  abandoned when an initial fix attempt built on it failed, and only
+  reconfirmed later.
+
+The pattern was consistent: reliable for structure and throughput, unreliable
+for specific facts — and those are exactly the things that fail silently and
+plausibly rather than loudly.
