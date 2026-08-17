@@ -3,7 +3,6 @@
 #include "depth_identify.h"
 #include "logging.h"
 #include "velocity_identify.h"
-#include "view_cb.h"
 
 #include <windows.h>
 #include <wrl/client.h>
@@ -24,9 +23,11 @@ namespace mv
 namespace
 {
 
-// Frames per F8 burst; each frame writes velocity + back buffer. ~1s of
-// gameplay, enough for video and N-1/N warp validation pairs.
-constexpr int kCaptureFrames = 60;
+// Frames per F8 burst; each frame writes velocity + back buffer. Tuned for
+// ~20s of real gameplay at this title's observed ~120fps at reduced
+// resolution (960x540) - measured 116-123fps across two bursts, not a fixed
+// engine rate, so this is an estimate rather than an exact figure.
+constexpr int kCaptureFrames = 2400;
 
 // Slots in flight. GPU trails CPU by a few frames, so copies aren't
 // immediately readable; round-robin and map only once the fence passes.
@@ -56,10 +57,6 @@ struct Slot
     ComPtr<ID3D12Resource> velocityBuffer;
     ComPtr<ID3D12Resource> colorBuffer;
     ComPtr<ID3D12Resource> depthBuffer;
-    // DEFAULT-heap UAV the compute shader writes into (can't write READBACK
-    // directly); copied into viewCbReadback afterward.
-    ComPtr<ID3D12Resource> viewCbUav;
-    ComPtr<ID3D12Resource> viewCbReadback;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> commandList;
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> velocityFootprints;
@@ -83,8 +80,6 @@ struct Slot
     bool hasVelocity = false;
     bool hasDepth = false;
     int depthCopies = 0;
-    ViewCbCandidate viewCbCandidates[kViewCbCandidates]{};
-    int viewCbCount = 0;
     // Identity of the command list the velocity copy was recorded onto. Used
     // only as a key to check submission - never dereferenced, we hold no ref.
     IUnknown* recordedList = nullptr;
@@ -165,11 +160,9 @@ std::atomic<int> g_burstPresentsLeft{0};
 // from the start.
 std::atomic<bool> g_burstArmed{false};
 
-// Turns on root-CBV bind counting immediately (live for the whole first
-// captured frame) and arms the burst for the next Present.
+// Arms the burst for the next Present.
 void ArmBurst()
 {
-    ViewCbSetTracking(true);
     g_burstArmed.store(true, std::memory_order_relaxed);
 }
 
@@ -191,11 +184,8 @@ std::atomic<bool> g_hotkeyStop{false};
 std::thread g_hotkeyThread;
 
 std::atomic<bool> g_depthMetadataWritten{false};
-std::atomic<bool> g_viewCbMetadataWritten{false};
 std::atomic<uint64_t> g_depthEdgeReports{0};
 std::atomic<bool> g_depthAfterVelocityReported{false};
-std::atomic<bool> g_viewCbFallbackReported{false};
-std::atomic<bool> g_viewCbEverSeen{false};
 // Frames where depth arrived but velocity never did. Counted rather than
 // silently discarded - worth surfacing in the log.
 std::atomic<uint64_t> g_framesWithoutVelocity{0};
@@ -273,8 +263,8 @@ bool DepthCaptureEnabled()
         if (off)
         {
             Log("capture: MV_CAPTURE_DEPTH=0 - scene depth will NOT be copied this session. The dump "
-                "will have no meta_depth.txt and no depth_*.bin, so the analytical reprojection cannot "
-                "run on it. This is the bandwidth control test, not a normal capture.");
+                "will have no meta_depth.txt and no depth_*.bin. This is the bandwidth control test, "
+                "not a normal capture.");
         }
         return !off;
     }();
@@ -541,10 +531,6 @@ void WriteMetadata(const Slot& slot)
         }
     }
     EnqueueWrite(DumpDir() + "meta.txt", std::vector<uint8_t>(meta.begin(), meta.end()));
-    // View constant buffer sidecar header; DrainSlot appends one line per frame.
-    const std::string viewCbHeader = "# captureIndex,slot,gpuVirtualAddress,bindCount,bytes  (slot k starts at k*" +
-                                     std::to_string(kViewCbBytes) + " in viewcb_<captureIndex>.bin)\n";
-    EnqueueWrite(DumpDir() + "viewcb.csv", std::vector<uint8_t>(viewCbHeader.begin(), viewCbHeader.end()));
     // Truncate the per-frame sidecar so a new session never appends onto the
     // previous one's indices.
     const std::string header = "# captureIndex,gameFrameIndex\n";
@@ -578,14 +564,6 @@ void WriteDepthMetadata(const Slot& slot)
     }
     EnqueueWrite(DumpDir() + "meta_depth.txt", std::vector<uint8_t>(meta.begin(), meta.end()));
     Log("capture: depth metadata written - " + meta);
-}
-
-void WriteViewCbMetadata()
-{
-    std::string meta;
-    meta += "viewcb_candidates=" + std::to_string(kViewCbCandidates) + "\n";
-    meta += "viewcb_stride=" + std::to_string(kViewCbBytes) + "\n";
-    EnqueueWrite(DumpDir() + "meta_viewcb.txt", std::vector<uint8_t>(meta.begin(), meta.end()));
 }
 
 // Maps one finished readback buffer out to a vector.
@@ -624,11 +602,7 @@ bool DrainSlot(Slot& slot)
     std::vector<uint8_t> depthData;
     const bool haveDepth = slot.hasDepth && MapOut(slot.depthBuffer.Get(), slot.depthBytes, depthData);
 
-    std::vector<uint8_t> viewCbData;
-    const UINT64 viewCbBytes = static_cast<UINT64>(kViewCbCandidates) * kViewCbBytes;
-    const bool haveViewCb = slot.viewCbCount > 0 && MapOut(slot.viewCbReadback.Get(), viewCbBytes, viewCbData);
-
-    const size_t total = velocityData.size() + colorData.size() + depthData.size() + viewCbData.size();
+    const size_t total = velocityData.size() + colorData.size() + depthData.size();
     if (!WriteQueueHasRoom(total))
     {
         const uint64_t n = g_droppedFrames.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -648,26 +622,6 @@ bool DrainSlot(Slot& slot)
     {
         sprintf_s(nameBuf, "depth_%05d.bin", slot.captureIndex);
         EnqueueWrite(DumpDir() + nameBuf, std::move(depthData));
-    }
-    if (haveViewCb)
-    {
-        sprintf_s(nameBuf, "viewcb_%05d.bin", slot.captureIndex);
-        EnqueueWrite(DumpDir() + nameBuf, std::move(viewCbData));
-        std::string lines;
-        for (int i = 0; i < slot.viewCbCount; ++i)
-        {
-            char line[128]{};
-            sprintf_s(
-                line,
-                "%d,%d,%llu,%u,%u\n",
-                slot.captureIndex,
-                i,
-                static_cast<unsigned long long>(slot.viewCbCandidates[i].address),
-                slot.viewCbCandidates[i].bindCount,
-                slot.viewCbCandidates[i].bytes);
-            lines += line;
-        }
-        EnqueueWrite(DumpDir() + "viewcb.csv", std::vector<uint8_t>(lines.begin(), lines.end()), /*append=*/true);
     }
 
     // Records which GAME frame this capture came from. Capture indices just
@@ -805,7 +759,6 @@ Slot* AcquireSlotForFrame(unsigned long long frame)
             candidate.hasVelocity = false;
             candidate.hasDepth = false;
             candidate.depthCopies = 0;
-            candidate.viewCbCount = 0;
             candidate.recordedList = nullptr;
             candidate.velocitySubmitted = false;
             return &candidate;
@@ -925,18 +878,6 @@ void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velo
     slot->recordedList = ComIdentity(cmdList);
     slot->velocitySubmitted = false;
     slot->queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
-    // Take this frame's root-CBV bind counts HERE rather than at Present.
-    //
-    // At Present, the counting window is "everything since the last Present" -
-    // only one frame's command stream if the game never starts recording the
-    // next frame before presenting. UE5 sometimes does, and a window that
-    // straddles the boundary can pick up the NEXT frame's View buffer, which
-    // anti-correlates velocity against the wrong frame's ClipToPrevClip.
-    //
-    // The velocity buffer's RENDER_TARGET -> shader-resource edge sits inside
-    // frame N's command stream, after every draw that binds its View buffer -
-    // snapshotting here ties the two together by construction.
-    slot->viewCbCount = ViewCbTakeCandidates(slot->viewCbCandidates, kViewCbCandidates);
     slot->hasVelocity = true;
 }
 
@@ -1097,15 +1038,6 @@ void OnPresent(IDXGISwapChain* swapChain)
 
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    // 0. Take (and clear) whatever root-CBV binds are left over from this frame.
-    //
-    // The counts that matter are taken at the velocity barrier
-    // (OnVelocityReadable); this is only a fallback. Must clear every frame
-    // regardless: UE5 recycles constant-buffer addresses, so a stale one is
-    // memory read through an unbounded root descriptor, not just old data.
-    ViewCbCandidate frameCandidates[kViewCbCandidates]{};
-    const int frameCandidateCount = ViewCbTakeCandidates(frameCandidates, kViewCbCandidates);
-
     // An armed burst begins here, at a frame boundary, so the first captured
     // frame is one whose recording was watched from the start.
     if (g_burstArmed.exchange(false, std::memory_order_relaxed))
@@ -1123,7 +1055,6 @@ void OnPresent(IDXGISwapChain* swapChain)
         if (g_framesRemaining.load(std::memory_order_relaxed) > 0 && VelocityPassIsSilent(presented, &silentFor))
         {
             const int short_by = g_framesRemaining.exchange(0, std::memory_order_relaxed);
-            ViewCbSetTracking(false);
             Log("capture: burst ENDED - the game has not rendered the velocity pass for " + std::to_string(silentFor) +
                 " frames, so there is nothing left to capture. " + std::to_string(short_by) + " of the requested " +
                 std::to_string(kCaptureFrames) +
@@ -1139,7 +1070,6 @@ void OnPresent(IDXGISwapChain* swapChain)
         g_burstPresentsLeft.fetch_sub(1, std::memory_order_relaxed) <= 1)
     {
         const int short_by = g_framesRemaining.exchange(0, std::memory_order_relaxed);
-        ViewCbSetTracking(false);
         Log("capture: burst ENDED short - " + std::to_string(kBurstPresentBudget) + " frames presented and " +
             std::to_string(short_by) + " of the requested " + std::to_string(kCaptureFrames) +
             " never landed. The dump has what did. Ending rather than waiting: a burst that "
@@ -1205,47 +1135,20 @@ void OnPresent(IDXGISwapChain* swapChain)
         slot->state = SlotState::Free;
         return;
     }
-    if (slot->viewCbCount == 0 && frameCandidateCount > 0)
-    {
-        // Nothing was bound by the time the velocity edge arrived - fall back
-        // to what was bound over the whole Present interval. Weaker (can
-        // straddle a frame boundary, the same pairing error the snapshot was
-        // moved off Present to avoid), but beats capturing nothing for a
-        // title that binds its View buffer after the velocity pass.
-        slot->viewCbCount = frameCandidateCount;
-        for (int i = 0; i < frameCandidateCount; ++i)
-        {
-            slot->viewCbCandidates[i] = frameCandidates[i];
-        }
-        if (!g_viewCbFallbackReported.exchange(true))
-        {
-            Log("capture: no root constant buffer had been bound by the time the velocity buffer became "
-                "readable, so the View buffer is being sampled over the whole Present interval instead. "
-                "That interval can straddle a frame boundary; treat per-frame agreement in the offline "
-                "reprojection as the check on whether it did.");
-        }
-    }
-
     // Every captured frame must carry every artefact this session can produce.
     //
     // Partial frames cluster at burst edges: F8 arrives mid-frame, after
-    // depth edges but before the velocity edge, or CBV tracking switches on
-    // mid-frame after the View-buffer binds. Dropping those beats keeping
+    // depth edges but before the velocity edge. Dropping those beats keeping
     // them - a dump with inconsistent frames forces every offline tool to
     // special-case it, and getting that wrong means comparing against the
     // wrong frame silently.
     //
-    // Each condition gates on the artefact having been produced at least
-    // once, so a title that never identifies depth or never binds a CBV
-    // still captures velocity rather than nothing.
+    // Gates on the artefact having been produced at least once, so a title
+    // that never identifies depth still captures velocity rather than nothing.
     const char* missing = nullptr;
     if (!slot->hasDepth && DepthCaptureEnabled() && IdentifiedDepthResource() != nullptr)
     {
         missing = "depth";
-    }
-    else if (slot->viewCbCount == 0 && g_viewCbEverSeen.load(std::memory_order_relaxed))
-    {
-        missing = "the View constant buffer";
     }
     if (missing != nullptr)
     {
@@ -1356,45 +1259,6 @@ void OnPresent(IDXGISwapChain* swapChain)
         D3D12_RESOURCE_STATE_PRESENT,
         g_originalResourceBarrier);
 
-    // The View constant buffer, read straight off the GPU addresses bound
-    // this frame. Recorded on OUR command list on purpose: setting a compute
-    // root signature/PSO on a list the game is still recording into would
-    // corrupt its next draws.
-    if (slot->viewCbCount > 0)
-    {
-        const UINT64 viewCbBytes = static_cast<UINT64>(kViewCbCandidates) * kViewCbBytes;
-        if (slot->viewCbUav == nullptr && !CreateDefaultUavBuffer(g_device.Get(), viewCbBytes, slot->viewCbUav))
-        {
-            Log("capture: failed to create the View constant buffer UAV; continuing without it");
-            slot->viewCbCount = 0;
-        }
-        if (slot->viewCbCount > 0 && slot->viewCbReadback == nullptr &&
-            !CreateReadbackBuffer(g_device.Get(), viewCbBytes, slot->viewCbReadback))
-        {
-            Log("capture: failed to create the View constant buffer readback; continuing without it");
-            slot->viewCbCount = 0;
-        }
-        if (slot->viewCbCount > 0 && !ViewCbRecordCopies(
-                                         g_device.Get(),
-                                         slot->commandList.Get(),
-                                         slot->viewCbUav.Get(),
-                                         slot->viewCbReadback.Get(),
-                                         slot->viewCbCandidates,
-                                         slot->viewCbCount,
-                                         g_originalResourceBarrier))
-        {
-            slot->viewCbCount = 0;
-        }
-        if (slot->viewCbCount > 0)
-        {
-            g_viewCbEverSeen.store(true, std::memory_order_relaxed);
-            if (!g_viewCbMetadataWritten.exchange(true))
-            {
-                WriteViewCbMetadata();
-            }
-        }
-    }
-
     if (FAILED(slot->commandList->Close()))
     {
         return;
@@ -1416,7 +1280,6 @@ void OnPresent(IDXGISwapChain* swapChain)
     const int remaining = g_framesRemaining.fetch_sub(1) - 1;
     if (remaining <= 0)
     {
-        ViewCbSetTracking(false);
         // "Recorded" is the honest word: last frames may still be in flight
         // on the GPU, and drained frames are only queued for the writer, not
         // necessarily on disk yet. Only ShutdownCapture guarantees that.

@@ -63,12 +63,11 @@ game — `results/validation_*.txt` is generated verbatim by
 are large and gitignored), and `mv_testhost` needs nothing but the built DLL.
 Re-running both against the same inputs reproduces every number here exactly.
 
-![full-screen field, Skyrunner](results/motion_field_dense_skyrunner_video.png)
+![motion field, Skyrunner](results/motion_field_still_skyrunner.png)
 
 Left: the game's own back buffer. Middle: `SceneVelocity` as written by the
-engine — dynamic/WPO objects only, correctly sparse. Right: the same frame
-with the black pixels filled in by reprojecting depth through
-`View_ClipToPrevClip`. Video: `results/motion_field_dense_skyrunner_video.mp4`.
+engine — dynamic/WPO objects only, correctly sparse. Right: the field
+composited over the frame.
 
 | test | result | source |
 |---|---|---|
@@ -76,7 +75,6 @@ with the black pixels filled in by reprojecting depth through
 | `mv_testhost` debug-layer harness | 0 errors over 240 hooked frames, correct resource picked out of 4 structural look-alikes every run; refuses to pick between 2 indistinguishable candidates when told to | run directly, no game needed |
 | warp-and-difference, 120-frame capture | 102/103 pairs improved, +37.7% mean error reduction, beats the best possible rigid shift by 59.9% | `results/validation_skyrunner.txt`, `results/warp_validation_skyrunner.png` |
 | warp-and-difference, 60-frame capture (video above) | 47/47 pairs improved, +53.6% mean error reduction | `results/validation_skyrunner_video.txt` |
-| decode vs. analytical reprojection (no image matching involved) | slope 1.0000 / 0.9997, r = 1.0000 / 0.9998, over 18,076,704 pixels | `results/validation_skyrunner_video.txt` |
 | decode vs. block-matched image motion | corr X +0.99, Y +0.94; engine decode beats a linear decode by ~4-6px RMS | `results/decode_scatter_skyrunner*.png` |
 
 To check any of these yourself:
@@ -154,18 +152,21 @@ different reasons:
   60%.
 - *Block matching* (pyramidal, sub-pixel) as an independent, non-buffer ground
   truth for per-pixel and per-region comparison against the decode.
-- *Analytical reprojection*, the strongest reference because it never looks at
-  the image at all: for static geometry, the previous frame's screen position
-  follows purely from current depth and `View_ClipToPrevClip`, which is a
-  transcription of the engine's own `ComputeStaticVelocity`. The hook reads
-  the View uniform buffer out of the process by GPU virtual address (no
-  resource pointer), and the byte offset of `View_ClipToPrevClip` is derived
-  per-dump from a reciprocal-`float4` anchor plus `SceneView.h`'s member
-  ordering, never hardcoded. This measured slope 1.0000/0.9997 (r =
-  1.0000/0.9998) against the decode over 18M pixels on Skyrunner, and is also
-  what fills in the full-screen field (~57% of a frame reconstructed from
-  depth, ~23% from the buffer itself, the far plane left as no-data rather
-  than a fabricated number).
+
+An analytical reference reconstructed from depth and the engine's View
+uniform buffer (`View_ClipToPrevClip`) was also built and, on Skyrunner,
+measured the decode at slope 1.0000/0.9997 against 18M pixels — the strongest
+result in the project, because it never looks at the image at all. That
+capture path (reading the View buffer out of the process via root constant
+buffer view addresses) turned out to have an unresolved intermittent bug —
+~42% of frames in a later, higher-churn capture regressed at the right offset
+but the wrong scale, and the investigation in `DEBUGGING.md` ("The View buffer
+regresses at the right offset and the wrong scale") ruled out every mechanism
+this project had the tooling to test without settling on a cause. Rather than
+ship an extraction path with a known, unexplained failure mode, it has been
+removed: `hook/src/view_cb.*`, `tools/reproject.py` and the dense/full-screen
+mode of `make_video.py` are gone, and validation now reports only on the
+sparse `SceneVelocity` buffer as written by the engine.
 
 **Debugging** Two rules run through the whole log: re-derive constants
 from primary sources instead of trusting recalled or fitted values, and leave

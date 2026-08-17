@@ -41,17 +41,17 @@ VELOCITY_FORMATS = {
 def load_meta(dump_dir):
     """Everything the hook recorded about the dump's layout.
 
-    Three files, merged. meta.txt is written once, when the colour readback
-    buffer is created; meta_depth.txt and meta_viewcb.txt are written later,
-    when (and only if) those parts of the capture were identified. They are
-    separate on purpose - depth identification cannot start until velocity
-    identification has produced an extent to test against, so waiting for it
-    before writing meta.txt would risk never writing meta.txt at all on a
-    session where depth is never found. A dump missing meta_depth.txt is a dump
-    with no depth in it, which is what it looks like here too.
+    Two files, merged. meta.txt is written once, when the colour readback
+    buffer is created; meta_depth.txt is written later, when (and only if)
+    scene depth was identified - depth identification cannot start until
+    velocity identification has produced an extent to test against, so
+    waiting for it before writing meta.txt would risk never writing meta.txt
+    at all on a session where depth is never found. A dump missing
+    meta_depth.txt is a dump with no depth in it, which is what it looks like
+    here too.
     """
     meta = {}
-    for name in ("meta.txt", "meta_depth.txt", "meta_viewcb.txt"):
+    for name in ("meta.txt", "meta_depth.txt"):
         path = os.path.join(dump_dir, name)
         if not os.path.exists(path):
             continue
@@ -383,8 +383,7 @@ def velocity_written_mask(path, meta):
 #
 # The values are DeviceZ exactly as the shader would read them: UE5 uses a
 # reversed-Z buffer, so 1.0 is the near plane and 0.0 is the far plane / sky.
-# Nothing is linearised here - the reprojection in reproject.py wants DeviceZ,
-# because View_ClipToPrevClip is a clip-space transform.
+# Nothing is linearised here.
 DEPTH_PLANE0_DECODERS = {
     39: "float32",   # R32_TYPELESS       - plane 0 of R32G8X24_TYPELESS
     40: "float32",   # D32_FLOAT
@@ -434,178 +433,6 @@ def load_depth(path, meta):
         packed = out.view(np.uint32).reshape(h, w)
         return (packed & 0x00FFFFFF).astype(np.float32) / 16777215.0
     return out.view(np.uint16).reshape(h, w).astype(np.float32) / 65535.0
-
-
-# ---------------------------------------------------------------------------
-# The View uniform buffer.
-#
-# The hook copies the few most frequently bound root constant buffers of each
-# frame, without deciding which one is the View uniform buffer. That decision is
-# made here, from the buffer's own contents, because deciding it in-process
-# would mean hardcoding a struct offset for one build of one game - the exact
-# class of mistake the previous phase of this project was about.
-
-def load_view_cb(dump_dir, index, meta):
-    """The captured candidate constant buffers for one frame, as (n, stride) uint8."""
-    path = os.path.join(dump_dir, f"viewcb_{index:05d}.bin")
-    if not os.path.exists(path):
-        return None
-    stride = meta.get("viewcb_stride", 4096)
-    raw = np.fromfile(path, dtype=np.uint8)
-    return raw.reshape(-1, stride)
-
-
-def find_size_and_inv_size(buf, min_dim=64, max_dim=16384, tolerance=1e-4):
-    """Offsets of every float4 of the form (W, H, 1/W, 1/H) in a buffer.
-
-    This is the anchor the whole View-buffer layout is derived from, and it is
-    self-validating in a way that matching against an expected resolution is
-    not: two of the four floats have to be the reciprocals of the other two, to
-    within float precision. That is not a coincidence any other four bytes in a
-    few-KB struct are going to produce.
-
-    It matters that this does NOT test against the velocity texture's extent.
-    View_ViewSizeAndInvSize is the view RECT, and UE rounds render targets up -
-    on the third-party title the velocity texture is 1708x1068 against a
-    1707x1067 back buffer - so requiring them to be equal would reject the
-    correct answer. The size is read out rather than matched.
-
-    UE's View uniform buffer contains more than one field with this shape
-    (View_ViewSizeAndInvSize and View_BufferSizeAndInvSize at least), so this
-    returns all of them in offset order; the first is the view rect.
-    """
-    words = buf[: (len(buf) // 4) * 4].view(np.float32)
-    hits = []
-    for i in range(0, len(words) - 3, 4):  # float4s are 16-byte aligned
-        w, h, iw, ih = (float(x) for x in words[i:i + 4])
-        if not (min_dim <= w <= max_dim and min_dim <= h <= max_dim):
-            continue
-        if iw <= 0.0 or ih <= 0.0:
-            continue
-        if abs(iw * w - 1.0) < tolerance and abs(ih * h - 1.0) < tolerance:
-            hits.append((i * 4, (w, h, iw, ih)))
-    return hits
-
-
-# Byte distance from View_ClipToPrevClip to View_ViewSizeAndInvSize, read off
-# the member ordering in Engine/Source/Runtime/Engine/Public/SceneView.h:
-#
-#     FMatrix44f ClipToPrevClip          64      <- what we want
-#     FMatrix44f ClipToPrevClipWithAA    64
-#     FVector4f  TemporalAAJitter        16
-#     FVector4f  GlobalClippingPlane     16
-#     FVector2f  FieldOfViewWideAngles    8
-#     FVector2f  PrevFieldOfViewWideAngles 8
-#     FVector4f  ViewRectMin             16
-#     FVector4f  ViewSizeAndInvSize            <- the anchor
-#
-# 64+64+16+16+8+8+16 = 192. NOTE the version dependence: UE 5.7.1 inserts
-# FirstPersonFieldOfViewWideAngles and PrevFirstPersonFieldOfViewWideAngles
-# (two more FVector2f) between PrevFieldOfViewWideAngles and ViewRectMin, which
-# makes the distance 208 there. The offsets are checked below rather than
-# trusted, and both are tried.
-VIEW_LAYOUTS = {
-    # name: (clipToPrevClip, clipToPrevClipWithAA, temporalAAJitter, viewRectMin) relative to the anchor
-    "UE 5.2-style": (-192, -128, -64, -16),
-    "UE 5.7-style": (-208, -144, -80, -16),
-}
-
-
-def read_matrix(buf, offset):
-    """A float4x4 from a byte offset, as (4, 4) with M[row][col].
-
-    Row-major, matching both FMatrix44f's C++ memory layout and how the shader
-    reads it: UE compiles all its HLSL with D3DCOMPILE_PACK_MATRIX_ROW_MAJOR
-    (D3DShaderCompiler.cpp:1343, and `-Zpr` on the DXC path), so a float4x4 in a
-    uniform buffer is packed row-major and `mul(v, M)` is a row-vector product
-    over exactly these bytes. Without that flag HLSL packs matrices
-    column-major, the shader would see the transpose, and every reprojection
-    below would be wrong in a way that still looks like a plausible motion
-    field - so it is worth being able to point at the line.
-    """
-    return buf[offset:offset + 64].view(np.float32).reshape(4, 4).astype(np.float64)
-
-
-def derive_view_layout(buf, render_extent=None):
-    """Work out where ClipToPrevClip is in a candidate buffer, or return None.
-
-    `render_extent` is the captured velocity texture's (width, height). Passing
-    it is strongly recommended and the reason is a real failure: a (W, H, 1/W,
-    1/H) float4 is a distinctive shape but it is not unique even within UE's own
-    View buffer, which also carries BufferSizeAndInvSize and several smaller
-    ones for downsampled buffers. Worse, an unrelated constant buffer can
-    contain one too - and when the top-ranked candidate slot happened not to be
-    the View buffer, a (66, 64, 1/66, 1/64) float4 in it anchored the layout at
-    a completely wrong offset, passed three of the four structural checks, and
-    produced a plausible-looking matrix that regressed at slope 0.0015.
-
-    Constraining the anchor to something near the render extent fixes that, and
-    it is not a fitted constant: the extent comes from the capture's own
-    meta.txt. UE rounds render targets up, so the view rect can be a pixel or
-    two smaller than the texture - measured 1707x1044 against a 1708x1044
-    velocity buffer - hence a tolerance rather than equality.
-
-    Returns a dict with the derived offsets, the view rect, the matrices and a
-    list of the consistency checks that were applied - so a caller can print
-    the evidence rather than a verdict.
-    """
-    anchors = find_size_and_inv_size(buf)
-    if render_extent is not None:
-        tolerance = 8
-        anchors = [a for a in anchors
-                   if abs(a[1][0] - render_extent[0]) <= tolerance
-                   and abs(a[1][1] - render_extent[1]) <= tolerance]
-    if not anchors:
-        return None
-    anchor_offset, (vw, vh, _, _) = anchors[0]
-    best = None
-    for name, (clip_rel, clip_aa_rel, jitter_rel, rect_rel) in VIEW_LAYOUTS.items():
-        clip_off = anchor_offset + clip_rel
-        if clip_off < 0:
-            continue
-        clip = read_matrix(buf, clip_off)
-        clip_aa = read_matrix(buf, anchor_offset + clip_aa_rel)
-        jitter = buf[anchor_offset + jitter_rel:anchor_offset + jitter_rel + 16].view(np.float32).astype(np.float64)
-        rect_min = buf[anchor_offset + rect_rel:anchor_offset + rect_rel + 16].view(np.float32).astype(np.float64)
-        checks = []
-        # 1. ClipToPrevClip and ClipToPrevClipWithAA are adjacent members that
-        #    differ ONLY by the TAA jitter, so they must be close but not equal.
-        #    This is the strongest structural test available and it does not
-        #    involve the velocity data at all.
-        spread = float(np.max(np.abs(clip - clip_aa)))
-        checks.append(("ClipToPrevClip and ...WithAA differ, but only slightly",
-                       0.0 < spread < 0.1, f"max|difference| = {spread:.6f}"))
-        # 2. Every entry finite and O(1). A projective clip-to-clip transform for
-        #    a plausible camera step has no huge entries.
-        finite = bool(np.all(np.isfinite(clip))) and float(np.max(np.abs(clip))) < 100.0
-        checks.append(("ClipToPrevClip is finite and O(1)", finite,
-                       f"max|entry| = {float(np.max(np.abs(clip))):.4f}"))
-        # 3. TemporalAAJitter is a sub-pixel offset in screen-position units.
-        jitter_ok = bool(np.all(np.isfinite(jitter))) and float(np.max(np.abs(jitter))) < 0.05
-        checks.append(("TemporalAAJitter is a sub-pixel offset", jitter_ok,
-                       f"= ({jitter[0]:+.6f}, {jitter[1]:+.6f}, {jitter[2]:+.6f}, {jitter[3]:+.6f})"))
-        # 4. ViewRectMin is a pixel offset: small, non-negative, integral.
-        rect_ok = bool(np.all(rect_min >= 0) and np.all(rect_min < 8192) and
-                       np.all(np.abs(rect_min - np.round(rect_min)) < 1e-3))
-        checks.append(("ViewRectMin is a non-negative integer pixel offset", rect_ok,
-                       f"= ({rect_min[0]:.1f}, {rect_min[1]:.1f})"))
-        passed = sum(1 for _, ok, _ in checks if ok)
-        candidate = {
-            "layout": name,
-            "anchor_offset": anchor_offset,
-            "anchors": anchors,
-            "clip_to_prev_clip_offset": clip_off,
-            "clip_to_prev_clip": clip,
-            "clip_to_prev_clip_with_aa": clip_aa,
-            "temporal_aa_jitter": jitter,
-            "view_rect_min": rect_min,
-            "view_size": (vw, vh),
-            "checks": checks,
-            "checks_passed": passed,
-        }
-        if best is None or passed > best["checks_passed"]:
-            best = candidate
-    return best
 
 
 def load_color(path, meta):

@@ -19,7 +19,6 @@
 #include "overlay.h"
 #include "resource_tracking.h"
 #include "velocity_identify.h"
-#include "view_cb.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -73,8 +72,6 @@ namespace
 //      [34]    SetGraphicsRoot32BitConstant
 //      [35]    SetComputeRoot32BitConstants
 //      [36]    SetGraphicsRoot32BitConstants
-//      [37]    SetComputeRootConstantBufferView
-//      [38]    SetGraphicsRootConstantBufferView
 //      [46]    OMSetRenderTargets
 //      [48]    ClearRenderTargetView
 //
@@ -92,8 +89,6 @@ constexpr size_t kPresentIndex = 8;
 constexpr size_t kPresent1Index = 22;
 constexpr size_t kExecuteCommandListsIndex = 10;
 constexpr size_t kResourceBarrierIndex = 26;
-constexpr size_t kSetComputeRootConstantBufferViewIndex = 37;
-constexpr size_t kSetGraphicsRootConstantBufferViewIndex = 38;
 constexpr size_t kOmSetRenderTargetsIndex = 46;
 constexpr size_t kClearRenderTargetViewIndex = 48;
 constexpr size_t kCreateRenderTargetViewIndex = 20;
@@ -113,8 +108,6 @@ using Present_t = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
 using Present1_t = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 using ExecuteCommandLists_t = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 using ResourceBarrier_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
-using SetRootConstantBufferView_t =
-    void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_VIRTUAL_ADDRESS);
 using OMSetRenderTargets_t = void(STDMETHODCALLTYPE*)(
     ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
 using ClearRenderTargetView_t = void(STDMETHODCALLTYPE*)(
@@ -144,8 +137,6 @@ Present_t g_originalPresent = nullptr;
 Present1_t g_originalPresent1 = nullptr;
 ExecuteCommandLists_t g_originalExecuteCommandLists = nullptr;
 ResourceBarrier_t g_originalResourceBarrier = nullptr;
-SetRootConstantBufferView_t g_originalSetComputeRootConstantBufferView = nullptr;
-SetRootConstantBufferView_t g_originalSetGraphicsRootConstantBufferView = nullptr;
 OMSetRenderTargets_t g_originalOMSetRenderTargets = nullptr;
 ClearRenderTargetView_t g_originalClearRenderTargetView = nullptr;
 CreateRenderTargetView_t g_originalCreateRenderTargetView = nullptr;
@@ -469,23 +460,6 @@ HookResourceBarrier(ID3D12GraphicsCommandList* cmdList, UINT numBarriers, const 
     }
 }
 
-// UE5's D3D12 RHI binds every uniform buffer (including the View buffer) as
-// a ROOT constant buffer view - note it here. Hottest hook in the file by a
-// wide margin: fires for every uniform buffer of every draw.
-void STDMETHODCALLTYPE HookSetGraphicsRootConstantBufferView(
-    ID3D12GraphicsCommandList* cmdList, UINT rootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS address)
-{
-    mv::ViewCbNoteRootCbv(address);
-    g_originalSetGraphicsRootConstantBufferView(cmdList, rootParameterIndex, address);
-}
-
-void STDMETHODCALLTYPE HookSetComputeRootConstantBufferView(
-    ID3D12GraphicsCommandList* cmdList, UINT rootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS address)
-{
-    mv::ViewCbNoteRootCbv(address);
-    g_originalSetComputeRootConstantBufferView(cmdList, rootParameterIndex, address);
-}
-
 void STDMETHODCALLTYPE HookOMSetRenderTargets(
     ID3D12GraphicsCommandList* cmdList,
     UINT numRenderTargetDescriptors,
@@ -767,16 +741,6 @@ bool InstallD3D12Hooks()
         reinterpret_cast<void*>(&HookResourceBarrier),
         reinterpret_cast<void**>(&g_originalResourceBarrier),
         "ResourceBarrier");
-    ok &= CreateHook(
-        VTableEntry(commandList.Get(), kSetGraphicsRootConstantBufferViewIndex),
-        reinterpret_cast<void*>(&HookSetGraphicsRootConstantBufferView),
-        reinterpret_cast<void**>(&g_originalSetGraphicsRootConstantBufferView),
-        "SetGraphicsRootConstantBufferView");
-    ok &= CreateHook(
-        VTableEntry(commandList.Get(), kSetComputeRootConstantBufferViewIndex),
-        reinterpret_cast<void*>(&HookSetComputeRootConstantBufferView),
-        reinterpret_cast<void**>(&g_originalSetComputeRootConstantBufferView),
-        "SetComputeRootConstantBufferView");
     ok &= CreateHook(
         VTableEntry(commandList.Get(), kOmSetRenderTargetsIndex),
         reinterpret_cast<void*>(&HookOMSetRenderTargets),

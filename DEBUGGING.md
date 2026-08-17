@@ -2678,3 +2678,296 @@ trigger plumbing (a stale early return), not the idea that a resize abandons
 the resource. Unlike the dual-width story earlier in this file, there was
 never a wrong turn in what caused the bug - only in getting the fix to
 actually run.
+
+## The View buffer regresses at the right offset and the wrong scale on ~42% of frames
+
+Not a SceneVelocity bug - the decode itself is independently validated (block
+matching, warp-and-difference, and the encode formula read directly out of
+the shipping shader) and none of that path touches the View buffer. This is
+about `reproject.py`'s analytical ground truth, which needs
+`View_ClipToPrevClip` and gets it from `view_cb.cpp`'s candidate-copy
+mechanism, described below.
+
+### How candidate selection actually works
+
+`view_cb.cpp` never decides which root CBV is the View buffer. It keeps a
+128-slot open-addressed hash table of `(address, bindCount)`, fed from
+`SetGraphicsRootConstantBufferView`/`SetComputeRootConstantBufferView` (every
+root CBV bind, every draw, hot path, no locking). At the velocity buffer's
+RENDER_TARGET→shader-resource barrier - deliberately *not* at Present, because
+UE5 sometimes starts recording the next frame before presenting this one, and
+a count window spanning that boundary would pick up the wrong frame's View
+buffer - `ViewCbTakeCandidates` snapshots the table, sorts by bind count, and
+**drains it** (`exchange(0)`) for the next frame. The top 4 addresses are
+copied with a one-line compute shader that reads straight off the raw GPU
+virtual address (root descriptors need no resource handle, which is the whole
+reason this works on a buffer the hook never otherwise sees).
+
+The hook does not decide which of the 4 is the real View buffer, either. That
+happens offline, in `mvtools.derive_view_layout`: find a `(W, H, 1/W, 1/H)`
+float4 near the capture's own render extent, use it to anchor
+`View_ClipToPrevClip` at a fixed member-order offset, and accept the first
+candidate slot (rank order: highest bind count first) whose matrix passes 3
+of 4 structural sanity checks (`ClipToPrevClip` vs `...WithAA` differ but
+barely; finite and O(1); jitter is sub-pixel; `ViewRectMin` is a small
+non-negative integer). `derive_view_layout`'s own docstring already documents
+one failure mode of this: an unrelated buffer's coincidental
+`(W,H,1/W,1/H)` float4 anchored the layout at the wrong offset once before
+and produced a plausible matrix that regressed at slope 0.0015. That is not
+what is happening here (see below), but it is the shape of bug this whole
+mechanism is built to survive, and worth knowing about going in.
+
+### What was ruled out, with evidence rather than inference
+
+**Offset/struct-layout confusion** - already checked before this session
+started: every bad-slope frame in `video_test7` derives the same offset
+(1872) as the clean frames. Confirmed again while building the tooling below:
+`anchor_offset` is 2064 on every frame checked, good and bad alike (2064 -
+192 = 1872, the `UE 5.2-style` layout in `VIEW_LAYOUTS`).
+
+**The `viewCbCount == 0` frame-straddling fallback**
+(`capture.cpp:OnPresent`, `if (slot->viewCbCount == 0 && frameCandidateCount
+> 0)`) - the code's own comment already flags this as capable of "pick[ing]
+up the NEXT frame's View buffer" when nothing had been bound by the time the
+velocity barrier fired. This looked like a strong candidate before checking:
+it is gated behind `g_viewCbFallbackReported.exchange(true)`, so it logs at
+most once per injection, and grepping the full `mv_hook.log` for "no root
+constant buffer had been bound" turns up 5 occurrences - all in short 60-frame
+bursts from **2026-08-14**, none anywhere near the four large (1200-/2400-
+frame) bursts on **2026-08-17** that `video_test7` belongs to. It never fired
+this session. Ruled out for this dump.
+
+**Picking a low-ranked candidate slot** - `derive_view_layout` is tried
+against slots in bind-count rank order and stops at the first pass. Across
+926 usable `video_test7` frames it picked slot 0 (the top-ranked, most-bound
+candidate) on 917 of them; the 9 exceptions are all `bindCount == 2`
+long-tail frames unrelated to badness (1 of 9 bad, in line with the base
+rate). Every single frame, good or bad, passes all 4 structural checks -
+`checks_passed` is 4/4 with zero exceptions in the sample. So this is not the
+`derive_view_layout` docstring's own documented failure mode: the mechanism
+is not grabbing a structurally-weaker impostor. It is confidently, correctly
+identifying *a* View buffer every time.
+
+### What the data actually shows
+
+Reproducing the regression per-frame (`tools/reproject.py`'s own loop,
+against every usable frame rather than the first 12 it prints) on
+`video_test7` (960x540, 926 usable frames):
+
+```
+bad_x: 393 (42.4%)   bad_y: 401 (43.3%)     [r > 0.9 and |slope - 1| > 0.25]
+X overshoot(slope>1.25)=390  undershoot(slope<0.75)=3
+Y overshoot(slope>1.25)=397  undershoot(slope<0.75)=4
+mean slope_x=1.2145  mean slope_y=1.2218
+```
+
+Two things stand out that a "wrong/unrelated buffer" story does not predict:
+
+1. **The error is almost entirely one-sided.** 390/393 bad-X frames and
+   397/401 bad-Y frames overshoot (`slope > 1.25`); undershoot is 3 and 4
+   frames respectively, indistinguishable from noise. A capture that
+   sometimes grabs a *different, unrelated* camera's View buffer (a second
+   viewport, a capture component) should produce errors scattered on both
+   sides of 1.0, not a >98%-one-directional bias.
+2. **Bad frames run in long, contiguous stretches, not scattered singletons.**
+   Runs of consecutive bad frames (by row order in the regression, not raw
+   frame index) average 6.9 frames and the longest is **57 consecutive bad
+   rows**, capture indices 1793-1999 (game frames 8895-9110). Good runs are
+   comparable in length (avg 5.6, max 81). This is a *state*, not a per-frame
+   coin flip - whatever is wrong holds for tens of frames at a time.
+
+`slope > 1` means the decoded (measured) velocity is systematically *larger*
+than what the candidate `ClipToPrevClip` predicts - i.e. the matrix being
+read describes a **smaller camera step than actually happened** between the
+frame that produced it and the one it's being regressed against. Frame 1684
+(quoted in the handoff: 2150 pixels, slope X +1.733 r=+0.975, slope Y +1.644
+r=+0.969) reproduces exactly under this methodology, and its candidate passed
+every check clean: `chosen_slot=0`, `checks_passed=4/4`, `bindCount=160`,
+address `506601984`.
+
+Put together, this does not look like "the wrong buffer, confidently
+misidentified" (which is the failure mode `derive_view_layout` was built to
+resist, and which its own checks and the offset/slot audit above rule out
+here). It looks like **the right buffer, read one generation late** - a real
+`FViewUniformShaderParameters` instance, structurally perfect, that
+corresponds to an earlier point in the view's history than the SceneVelocity
+and depth it is being paired with. A systematically-stale reference
+under-predicts the true one-frame delta whenever the camera's frame-to-frame
+motion is increasing, which is exactly the one-sided overshoot observed, and
+would hold for as long as that condition does, which is consistent with the
+run-length clustering. This is offered as the best-supported reading of the
+evidence in hand, not a proven mechanism - see "what wasn't checked" below.
+
+### A wrong turn: blaming ring congestion
+
+`video_test7`'s directory holds 1160 `vel_*.bin` files, but `viewcb.csv`'s
+`captureIndex` column runs 0-2398 and `mv_hook.log` reports "burst recorded,
+2400 frames" for this session - so roughly half of the frames the hook
+believes it successfully paired and queued for writing are missing from
+disk. The first explanation reached for was `capture.cpp`'s own documented
+congestion path: `kSlots = 4` in-flight readback slots, with a logged
+"no free slot" warning when the ring is exhausted - a very heavy-churn
+session (see below) stressing a 4-slot ring seemed plausible, and a csv/present
+gap of 2-3 skipped frames before a capture did correlate with a higher bad
+rate (31.4% at gap=1 vs 58-60% at gap=2-3).
+
+It does not hold up: `mv_hook.log`, filtered to this burst's exact window (by
+matching `ADOPTED`-line frame numbers against `frames.csv`'s
+`gameFrameIndex`), contains **zero** "no free slot" and zero "WRITE QUEUE
+FULL" lines. The ring was never reported exhausted. Whatever is dropping half
+the frames between "recorded" and "on disk" is not the congestion path this
+project already instruments for, and the present-index-gap correlation above
+is left as an observation, not a causal claim - it may just reflect whatever
+thinned the directory down to 1160 files in the first place, which is
+unexplained and worth asking about before trusting it.
+
+### The instrumentation gap
+
+`SceneVelocity`'s identification has real identity tracking: a selected
+resource pointer, a structural-filter shortlist, and the `ADOPTED`/`RIVAL`
+logging that caught this exact session's velocity target reallocating to a
+new address roughly every 10-15 frames (20 `ADOPTED` events inside
+`video_test7`'s ~20-second capture window alone -
+`kMaxAdoptions` was raised 8→64 earlier this session because of exactly this
+churn rate). The View buffer has **none of that**. `view_cb.cpp` re-derives
+"whatever address dominates this frame's binds" from scratch every frame, by
+design (`view_cb.h`: "no correlation needed, works regardless of when the
+backing resource was created") - which makes it naturally robust to the
+*address* changing every frame (confirmed: 908/926 frames in this dump chose
+a different address than the previous usable frame, which is expected ring
+behaviour and does not by itself predict badness). What it has no way to
+detect is a *generation* mismatch at a fixed address: whether the bytes the
+Present-time compute shader eventually reads are the same write the frame's
+own draws consumed, or a later one. Unlike the velocity/colour copies (issued
+inline in the game's own command list, at the exact barrier that makes the
+copy valid), the View CB read happens on the hook's own, separately-submitted
+command list - later, and address-only, with no resource handle to hold a
+reference through. `NoteSubmission`'s fence-coverage accounting (100%
+"strong" every burst this session, including this one) proves the *ordering*
+between the game's command list and the hook's read list, but that only
+establishes GPU submission order - it says nothing about whether the memory
+at that address still holds the generation the draws actually bound.
+
+### What wasn't checked
+
+- No GPU-timeline capture (PIX or equivalent) exists to directly observe
+  whether the View buffer's backing allocation is written between the game's
+  own draws and the hook's Present-time read. Everything above is inferred
+  from dump contents and log correlation, not observed on the timeline.
+- `skyrunner_video_final` (59 usable frames) and `skyrunner_reproject` (10
+  usable frames) were re-checked with the same per-frame methodology, not
+  just the pooled slope this project previously reported for them: **zero**
+  bad-X/bad-Y frames in either, at the per-frame level, not just pooled. So
+  this is not a bug hidden inside the "clean" dumps by averaging - those
+  dumps are genuinely clean, per-frame, on the sample available. Both are a
+  different, higher-resolution title (1708x1068 / 1708x1044) than
+  `video_test7`'s 960x540 - whether the difference is resolution, title, churn
+  rate, or capture size (59-180 frames vs. 926-2400) is not distinguished by
+  what's been checked.
+- The 57-frame run (capture indices 1793-1999) was not traced to a specific
+  logged reallocation event - the nearest `ADOPTED` line found by frame-number
+  search did not line up cleanly, and chasing that further needs the same
+  frame-numbering reconciliation (`g_frameCounter` vs. `gameFrameIndex`) done
+  properly rather than by inspection, which ran out of budget here.
+
+### Suggested next step
+
+Close the instrumentation gap rather than guess further: give the View CB
+path the same kind of generation evidence `ADOPTED`/`RIVAL` gives
+SceneVelocity. Concretely, something that can tell a future dump "the bytes
+copied for candidate N were written by the same draw that bound them" from
+"they weren't" - for instance, log (or copy alongside the candidate) a
+cheap, frequently-changing field already in the View struct itself, sampled
+both at the `OnVelocityReadable` barrier and again by the Present-time
+compute shader, so a mismatch between the two is directly visible in the
+dump instead of inferred from slope statistics after the fact.
+
+### Follow-up: built it, and it says the leading theory was wrong
+
+Implemented as `Slot::viewCbEarlyUav`/`viewCbEarlyReadback` and
+`RecordAndSubmitEarlyViewCb` in `capture.cpp`: the same top-4 candidates,
+read a second time on their own dedicated command list submitted immediately
+at the `OnVelocityReadable` barrier, instead of deferred to Present like the
+existing copy. Deliberately never the game's own command list - setting a
+compute PSO on a list the game is still recording into would corrupt its
+next draws, and a command list has no way to have its bound state read back
+and restored afterward, so there's no way to do this safely inline. No new
+fence: the early submission always lands on `g_queue` strictly before the
+slot's regular fence signal, and one queue completes work in submission
+order, so the existing drain wait already covers it. Output is
+`viewcb_early_<index>.bin`, addressed identically to `viewcb_<index>.bin`
+(see `viewcb.csv` for both). `tools/viewcb_generation_check.py` diffs the two
+per candidate and lines the result up against `reproject.py`'s own bad/good
+call for the same frame.
+
+`video_test10` (same title, same 960x540/heavy-churn conditions as
+`video_test7`, freshly captured with this build):
+
+```
+frames with a late copy: 1213
+  of those, also have an early copy: 1213  (missing early copy: 0)
+  any candidate differs between early and late read: 52 (4.3%)
+  the CHOSEN candidate (the one reproject.py would use) differs: 0 (0.0%)
+
+of 947 frames classifiable by reproject.py's slope test (514 bad):
+  chosen candidate DIFFERS early vs late:  0 bad, 0 good
+  chosen candidate SAME early and late:    514 bad, 433 good
+```
+
+Some candidates genuinely do churn in that window (4.3% - the instrumentation
+is measuring something real, not reading its own tail). But the *specific*
+candidate the offline pipeline actually uses never once changed between the
+two read times, on any of 1213 frames, including all 514 bad-slope ones. The
+"right buffer, one generation late" theory is dead: whatever is wrong is
+already wrong by the time the address is first noted at the barrier, not
+something that happens on the way to the Present-time read.
+
+Two more free checks (same dump, no rebuild) against the natural next
+guesses:
+
+- **Wrong camera, identifiable by address** - false. 285 distinct addresses
+  were chosen on bad frames, 257 on good frames, and 80 addresses appear on
+  *both* bad and good frames (on different presents) - not two disjoint
+  address pools, one View's and one impostor's. The bad-only and good-only
+  address ranges are also essentially the same span
+  (511710720-13259716096 vs. 511710720-13259714560).
+- **Engine updates the View buffer less often than it presents** - false.
+  Checked whether the chosen candidate's `ClipToPrevClip` ever repeats
+  byte-for-byte between one captured frame and the next: 0 of 145
+  Present-to-Present-adjacent pairs, 0 of 1109 pairs at any gap. It changes
+  every single frame.
+
+That rules out every mechanism this project currently has the tooling to
+test: not the known frame-straddling fallback (ruled out earlier, by log),
+not a stale read (ruled out here, by direct A/B), not a second camera at a
+distinguishable address, not a skipped engine-side update. What's left needs
+either GPU-timeline tooling this project doesn't have, or knowledge of the
+title's own rendering internals that isn't available from the outside. Given
+that, this is a reasonable place to stop chasing it through this capture
+path rather than keep guessing.
+
+### Decision: removed rather than shipped with a known, unexplained failure
+
+Cut instead of fixed. `hook/src/view_cb.h/.cpp`, the root-CBV hooks that fed
+it, `RecordAndSubmitEarlyViewCb`, `tools/reproject.py`,
+`tools/viewcb_generation_check.py`, and `mvtools`'s
+`derive_view_layout`/`VIEW_LAYOUTS`/`load_view_cb` machinery are gone, along
+with `make_video.py`'s dense/full-screen-field mode that depended on them.
+`SceneVelocity` extraction and its own decode are unaffected — none of the
+evidence for those (the descriptor match, the barrier invariant, the
+debug-layer harness, block matching, warp-and-difference, the shader
+disassembly) ever routed through the View buffer capture path.
+
+The reason for cutting rather than continuing to chase it: every controlled
+test built above ruled out a mechanism without finding the actual one, which
+is a different situation from the earlier bugs in this document (the
+`_FLOAT`/`_UNORM` enum, the doubled barrier count under the debug layer, the
+generation-mismatch hypothesis itself) where a single check settled the
+question. An intermittent ~42%-of-frames failure with no confirmed cause is
+not something to ship silently, and continuing to guess without GPU-timeline
+tooling this project doesn't have was not a good use of further time against
+this brief. Static-geometry reconstruction from `View_ClipToPrevClip` remains
+a real, engine-documented technique — see "An analytical ground truth: depth,
+the View uniform buffer, reprojection" above, including its clean 1.0000
+slope result on an earlier, lower-churn capture — should someone want to pick
+it back up with better instrumentation.

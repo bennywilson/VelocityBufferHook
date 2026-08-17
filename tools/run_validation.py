@@ -53,14 +53,6 @@ STEPS = [
      "construction, but it is the one that works on footage where per-pixel\n"
      "matching is defeated by motion blur and thin foliage - and its magnitude\n"
      "sweep is what discriminates the square-root encoding from a linear one."),
-    ("reproject.py", ["reproject.py", dump_dir],
-     "The only reference here that does not look at the image. Reprojects each pixel\n"
-     "through its depth and View_ClipToPrevClip - which is what the engine's own\n"
-     "ComputeStaticVelocity does - and regresses the decoded field against it. A\n"
-     "correct decode gives slope 1.000, with no correlation window and no failure mode\n"
-     "on foliage. Also builds the full-screen field, by applying the same calculation\n"
-     "to the pixels SceneVelocity never wrote. Needs a capture that includes depth and\n"
-     "the View uniform buffer; older dumps say so and stop."),
     ("warp_validate.py", ["warp_validate.py", dump_dir, figure_path],
      "Warp frame N-1 by frame N's field and score it, against three controls:\n"
      "a sign flip, the best possible single rigid translation, and a\n"

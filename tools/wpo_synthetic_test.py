@@ -1,8 +1,7 @@
 """Checks decode correctness on a synthetic velocity grid representative of
-WPO (world-position-offset) pixels - the population the analytical
-reprojection (reproject.py) cannot exercise, because it selects pixels whose
-depth-motion matches pure camera motion by construction, which is exactly how
-it excludes wind-animated foliage.
+WPO (world-position-offset) pixels - motion that is not pure camera motion,
+which is exactly the population wind-animated foliage belongs to and which no
+image-matching reference in this project resolves reliably either.
 
 Companion to mv_testhost.exe --wpo-encode-test <dir>, which renders a known
 (Vx, Vy, Vz) grid through the real EncodeVelocityToTexture()/
@@ -179,6 +178,5 @@ print(f"\n{'PASS' if ok else 'FAIL'}: mvtools.py's decode functions "
 if ok:
     print("This does not mean WPO pixels in a real capture decode to physically correct velocities - "
           "only that nothing about this project's decode logic is specific to static-camera-predictable "
-          "motion. The analytical reprojection's exclusion of WPO pixels remains a property of the "
-          "REFERENCE, not evidence the decode mishandles them.")
+          "motion.")
 sys.exit(0 if ok else 1)

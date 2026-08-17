@@ -195,28 +195,6 @@ struct DepthLookAlike {
     UINT dsvIndex = 0;
 };
 
-// The offsets this project's offline pass expects to find in UE 5.2's View
-// uniform buffer. The harness writes a synthetic View buffer using them so the
-// whole chain - hook copies a raw GPU address, tool finds the anchor, tool
-// reads the matrix - can be run end to end without a game.
-//
-// They are NOT asserted here as facts about any title. Which is the point: the
-// harness's buffer is one whose layout we chose, so a tool that finds the
-// anchor here has demonstrated it can find an anchor, not that 2064 is right
-// for Skyrunner. That has to come from Skyrunner's own bytes.
-constexpr UINT kViewClipToPrevClipOffset = 1872;
-constexpr UINT kViewTemporalAAJitterOffset = 2000;
-constexpr UINT kViewRectMinOffset = 2048;
-constexpr UINT kViewSizeAndInvSizeOffset = 2064;
-constexpr UINT kSyntheticViewCbBytes = 4096;
-
-// How many times per frame each synthetic constant buffer is bound. The hook
-// ranks candidates by bind count, so the "View" buffer has to out-bind the
-// decoy the way UE5's does - it is bound by every draw, a per-object buffer by
-// one.
-constexpr int kViewCbBindsPerFrame = 200;
-constexpr int kDecoyCbBindsPerFrame = 3;
-
 bool Check(HRESULT hr, const char* what) {
     if (FAILED(hr)) {
         printf("[testhost] FAILED %s: 0x%08lX\n", what, static_cast<unsigned long>(hr));
@@ -644,97 +622,6 @@ int main(int argc, char** argv) {
                target.height, static_cast<int>(target.format), target.why);
     }
 
-    // 2c. Two synthetic constant buffers, so the View-uniform-buffer path has
-    // something to find. This is an UPLOAD-heap buffer bound as a ROOT CBV,
-    // which is exactly how UE5's D3D12 RHI binds uniform buffers - the hook
-    // never sees a resource pointer for it, only a GPU virtual address, and the
-    // whole point of the exercise is that it reads that address anyway.
-    ComPtr<ID3D12Resource> viewCb;
-    ComPtr<ID3D12Resource> decoyCb;
-    {
-        D3D12_HEAP_PROPERTIES uploadProps{};
-        uploadProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC cbDesc{};
-        cbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        cbDesc.Width = 65536;
-        cbDesc.Height = 1;
-        cbDesc.DepthOrArraySize = 1;
-        cbDesc.MipLevels = 1;
-        cbDesc.Format = DXGI_FORMAT_UNKNOWN;
-        cbDesc.SampleDesc.Count = 1;
-        cbDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (!Check(device->CreateCommittedResource(
-                       &uploadProps, D3D12_HEAP_FLAG_NONE, &cbDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                       IID_PPV_ARGS(&viewCb)),
-                   "CreateCommittedResource(viewCb)") ||
-            !Check(device->CreateCommittedResource(
-                       &uploadProps, D3D12_HEAP_FLAG_NONE, &cbDesc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                       IID_PPV_ARGS(&decoyCb)),
-                   "CreateCommittedResource(decoyCb)")) {
-            return 1;
-        }
-        void* mapped = nullptr;
-        D3D12_RANGE noRead{0, 0};
-        if (SUCCEEDED(viewCb->Map(0, &noRead, &mapped)) && mapped != nullptr) {
-            auto* bytes = static_cast<uint8_t*>(mapped);
-            memset(bytes, 0, kSyntheticViewCbBytes);
-            // A ClipToPrevClip for a camera that has not moved is the identity,
-            // and that is what the harness models: it makes the expected
-            // reprojection exactly zero everywhere, so a non-zero result from
-            // the offline tool is a bug in the tool rather than a judgement
-            // call about a scene.
-            float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-            memcpy(bytes + kViewClipToPrevClipOffset, identity, sizeof(identity));
-            // ClipToPrevClipWithAA is the adjacent member, and the offline
-            // pass uses "these two are nearly but not exactly equal" as its
-            // structural check that it has found the right pair. Writing only
-            // the first one leaves the second as zeroes, which fails that
-            // check - so the harness would be testing the tool against a
-            // buffer that does not look like the thing it is for.
-            float withAa[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-            withAa[12] = 0.0004f; // the jitter delta, in screen-position units
-            withAa[13] = -0.0003f;
-            memcpy(bytes + kViewClipToPrevClipOffset + 64, withAa, sizeof(withAa));
-            const float jitter[4] = {0.0002f, -0.00015f, -0.0001f, 0.00025f};
-            memcpy(bytes + kViewTemporalAAJitterOffset, jitter, sizeof(jitter));
-            const float rectMin[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            memcpy(bytes + kViewRectMinOffset, rectMin, sizeof(rectMin));
-            const float sizeAndInv[4] = {
-                static_cast<float>(kVelocityWidth), static_cast<float>(kVelocityHeight),
-                1.0f / static_cast<float>(kVelocityWidth), 1.0f / static_cast<float>(kVelocityHeight)};
-            memcpy(bytes + kViewSizeAndInvSizeOffset, sizeAndInv, sizeof(sizeAndInv));
-            viewCb->Unmap(0, nullptr);
-        }
-        if (SUCCEEDED(decoyCb->Map(0, &noRead, &mapped)) && mapped != nullptr) {
-            memset(mapped, 0x5A, kSyntheticViewCbBytes);
-            decoyCb->Unmap(0, nullptr);
-        }
-    }
-
-    // A root signature whose only parameter is a root CBV. Root arguments can
-    // only be set once a matching root signature is bound, so this exists purely
-    // to make the SetGraphicsRootConstantBufferView calls below legal.
-    ComPtr<ID3D12RootSignature> cbRootSignature;
-    {
-        D3D12_ROOT_PARAMETER param{};
-        param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-        param.Descriptor.ShaderRegister = 0;
-        param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 1;
-        rsDesc.pParameters = &param;
-        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        ComPtr<ID3DBlob> blob;
-        ComPtr<ID3DBlob> error;
-        if (!Check(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error),
-                   "D3D12SerializeRootSignature") ||
-            !Check(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
-                                               IID_PPV_ARGS(&cbRootSignature)),
-                   "CreateRootSignature")) {
-            return 1;
-        }
-    }
-
     ComPtr<ID3D12Resource> backBuffers[kBackBufferCount];
     for (UINT i = 0; i < kBackBufferCount; ++i) {
         if (!Check(swapChain->GetBuffer(i, IID_PPV_ARGS(&backBuffers[i])), "GetBuffer")) {
@@ -836,30 +723,6 @@ int main(int argc, char** argv) {
         }
     };
 
-    // Root constant buffer traffic, in UE5's proportions: the View uniform
-    // buffer bound by every draw, a per-object buffer bound a handful of times.
-    // Nothing is drawn - binding a root argument is the whole of what the hook
-    // observes, and a draw would add a PSO and a pile of unrelated state for no
-    // extra coverage.
-    //
-    // This moves with the depth edges, for the same reason. In a UE5 frame the
-    // View uniform buffer is bound by every base-pass draw, i.e. before the
-    // velocity buffer is finished, and the hook snapshots the bind counts at
-    // the velocity barrier precisely so the constant buffer and the velocity
-    // buffer come from the same point in the command stream. Emitting the binds
-    // after that point instead exercises the fallback - and produced a dump
-    // with zero View buffers in it the first time, which is how the fallback
-    // came to exist.
-    auto emitCbTraffic = [&]() {
-        cmdList->SetGraphicsRootSignature(cbRootSignature.Get());
-        for (int i = 0; i < kViewCbBindsPerFrame; ++i) {
-            cmdList->SetGraphicsRootConstantBufferView(0, viewCb->GetGPUVirtualAddress());
-        }
-        for (int i = 0; i < kDecoyCbBindsPerFrame; ++i) {
-            cmdList->SetGraphicsRootConstantBufferView(0, decoyCb->GetGPUVirtualAddress());
-        }
-    };
-
     int totalErrors = 0;
 
     for (int frame = 0; frame < frames; ++frame) {
@@ -875,7 +738,6 @@ int main(int argc, char** argv) {
 
         if (depthBeforeVelocity) {
             emitDepthEdges();
-            emitCbTraffic();
         }
 
         for (LookAlike& target : lineUp) {
@@ -943,7 +805,6 @@ int main(int argc, char** argv) {
 
         if (!depthBeforeVelocity) {
             emitDepthEdges();
-            emitCbTraffic();
         }
 
         // Something trivial on the back buffer, so Present has real content
@@ -1138,17 +999,15 @@ int main(int argc, char** argv) {
             };
             const int velocities = count("vel_*.bin");
             const int depths = count("depth_*.bin");
-            const int viewCbs = count("viewcb_*.bin");
             printf("\n[testhost] ==== dump contents ====\n");
             printf("[testhost]   velocity frames: %d\n", velocities);
             printf("[testhost]   depth frames:    %d\n", depths);
-            printf("[testhost]   View CB frames:  %d\n", viewCbs);
             if (ambiguous) {
                 // Identification refuses to pick in this mode, so capturing
                 // NOTHING is the correct outcome and an empty dump is the
                 // assertion. A file here would mean the hook captured from a
                 // resource it had just said it could not identify.
-                dumpContentsPassed = velocities == 0 && depths == 0 && viewCbs == 0;
+                dumpContentsPassed = velocities == 0 && depths == 0;
                 printf("[testhost] %s\n",
                        dumpContentsPassed
                            ? "PASS - nothing was captured, which is correct when identification refused to pick"
@@ -1160,15 +1019,15 @@ int main(int argc, char** argv) {
                 // than assumed, because "the switch did nothing" and "the switch
                 // worked" produce the same console output otherwise - which is
                 // the exact shape of the bug this harness exists to catch.
-                dumpContentsPassed = velocities > 0 && depths == 0 && viewCbs == velocities;
+                dumpContentsPassed = velocities > 0 && depths == 0;
                 printf("[testhost] %s\n",
                        dumpContentsPassed
                            ? "PASS - MV_CAPTURE_DEPTH=0 suppressed depth and left the rest of the frame intact"
-                           : "FAIL - MV_CAPTURE_DEPTH=0 did not produce a velocity+View dump with no depth");
-            } else if (velocities > 0 && depths == velocities && viewCbs == velocities) {
-                printf("[testhost] PASS - every captured frame has velocity, depth and a View constant buffer\n");
+                           : "FAIL - MV_CAPTURE_DEPTH=0 did not produce a velocity dump with no depth");
+            } else if (velocities > 0 && depths == velocities) {
+                printf("[testhost] PASS - every captured frame has velocity and depth\n");
             } else {
-                printf("[testhost] FAIL - the dump is missing one of the three per-frame artefacts\n");
+                printf("[testhost] FAIL - the dump is missing one of the per-frame artefacts\n");
                 dumpContentsPassed = false;
             }
         }

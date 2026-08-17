@@ -5,7 +5,6 @@ add_library(mv_hook SHARED
   src/resource_tracking.cpp
   src/velocity_identify.cpp
   src/depth_identify.cpp
-  src/view_cb.cpp
   src/capture.cpp
   src/overlay.cpp
 )
