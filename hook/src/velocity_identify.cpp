@@ -213,15 +213,29 @@ std::atomic<uint64_t> g_rivalRunLength{0};
 std::atomic<uint64_t> g_lastRivalFrame{0};
 ID3D12Resource* g_lastRivalResource = nullptr;
 
-// The SECOND velocity target, when the engine is using two -
-// FVelocityRendering::GetFormat returns a different width depending on
-// NeedVelocityDepth() (PF_A16B16G16R16 vs PF_G16R16).
+// The SECOND velocity target, when the engine is using two. This was
+// originally written up as FVelocityRendering::GetFormat returning a
+// different width because NeedVelocityDepth() changed at runtime - that
+// diagnosis is WRONG (see DEBUGGING.md, "Correction: it works, and the width
+// story was wrong") and kept only as a note not to re-propose it. Every
+// adoption observed so far has been same width AND same format as the
+// selected resource: a plain reallocation to a new address with an
+// identical descriptor, not a format flip. The rival check below requires
+// matching width/height to the selected resource, so it cannot represent a
+// genuine width change even in principle - format is the only field it
+// doesn't pin down.
 std::atomic<ID3D12Resource*> g_identifiedAlt{nullptr};
 std::atomic<uint64_t> g_altWidth{0};
 std::atomic<uint32_t> g_altHeight{0};
 std::atomic<int> g_altFormat{0};
 
-constexpr int kMaxAdoptions = 8;
+// Sized for a single one-off reallocation, the only pattern seen before a
+// slow-motion sequence reallocated SceneVelocity 6 times in ~8 seconds and
+// exhausted this budget seconds before the pass was reported STOPPED - at
+// which point a further reallocation would have looked like silence rather
+// than being followed. Raised to give sustained churn real headroom instead
+// of a limit sized for a rare one-time event.
+constexpr int kMaxAdoptions = 64;
 std::atomic<int> g_adoptions{0};
 std::atomic<bool> g_adoptLimitReported{false};
 std::atomic<bool> g_decisionMade{false};
@@ -1042,10 +1056,13 @@ bool NoteRivalVelocityEdge(ID3D12Resource* resource, uint64_t frame)
             "RENDER_TARGET -> shader-resource edge on " +
             std::to_string(run) + " consecutive frames while the selected one (fmt=" +
             std::to_string(g_identifiedFormat.load(std::memory_order_relaxed)) +
-            ") took none. Same extent, same structural filter, different width: this is "
-            "FVelocityRendering::GetFormat returning the other of its two answers because "
-            "NeedVelocityDepth() changed at runtime. BOTH are now captured from, whichever takes the edge - "
-            "the pass moved, it did not stop.");
+            ") took none. Same extent, same structural filter" +
+            (static_cast<int>(desc.Format) == g_identifiedFormat.load(std::memory_order_relaxed)
+                 ? std::string(", same format: a reallocation to a new address with an identical "
+                                "descriptor")
+                 : std::string(", different format: possibly FVelocityRendering::GetFormat's other "
+                                "answer, unconfirmed - every prior adoption has been same-format")) +
+            ". BOTH are now captured from, whichever takes the edge - the pass moved, it did not stop.");
         return true;
     }
 
