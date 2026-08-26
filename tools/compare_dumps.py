@@ -1,0 +1,237 @@
+"""Are two capture dumps equivalent?
+
+The regression oracle for the Surface migration (docs/REFACTOR_PLAN.md): every
+phase that is supposed to change no behaviour is verified by capturing a dump
+before and after and running this.
+
+WHAT IS AND IS NOT REPRODUCIBLE, because it decides how this compares:
+
+A dump is NOT byte-identical run to run, and no refactor will make it so. Which
+frames land depends on slot contention - all four ring slots being in flight
+makes the hook skip a frame by design (see g_noFreeSlot in capture.cpp) - and
+that is a function of GPU/CPU timing, not of the code under test. Two runs of
+mv_testhost at 240 frames were measured at 84 and 86 captured frames.
+
+What IS reproducible is the CONTENT of a given game frame. Measured across two
+runs sharing 61 game frames: velocity, depth and colour all byte-identical, 61
+of 61, for all three. So the comparison keys on the game frame index that
+frames.csv records - not on the capture index, which is just a counter of what
+was drained and means nothing across runs.
+
+Consequence worth stating: this proves equivalence on the frames both runs
+happened to capture. A phase that broke capture for, say, only the first frame
+after a reopen could hide in the frames one run missed. The intersection size is
+therefore printed and gated - a comparison over a handful of frames is reported
+as WEAK rather than passed.
+
+Usage:
+    python compare_dumps.py <before_dir> <after_dir>
+    python compare_dumps.py <before_dir> <after_dir> --min-common 40
+
+Exit code 0 if equivalent, 1 if not, 2 if the comparison was too weak to mean
+anything.
+"""
+import argparse
+import hashlib
+import os
+import sys
+
+# Surfaces, as (manifest/meta name, file prefix). Extending this is what adding
+# a fourth surface looks like here.
+SURFACES = [
+    ("velocity", "vel"),
+    ("depth", "depth"),
+    ("color", "color"),
+    ("normals", "normals"),
+]
+
+
+def load_metadata(dump_dir):
+    """The dump's layout description, as a flat dict, from whichever format it uses.
+
+    Handles both sides of the Phase 4 migration: manifest.json once it exists,
+    meta.txt/meta_depth.txt before that. Without this the oracle stops working
+    on exactly the phase that changes the metadata format, which is the phase
+    that most needs it.
+    """
+    manifest = os.path.join(dump_dir, "manifest.json")
+    if os.path.exists(manifest):
+        import json
+        with open(manifest) as f:
+            return ("manifest.json", json.load(f))
+
+    meta = {}
+    found = []
+    for name in ("meta.txt", "meta_depth.txt"):
+        path = os.path.join(dump_dir, name)
+        if not os.path.exists(path):
+            continue
+        found.append(name)
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                meta[k] = v
+    if not found:
+        return (None, None)
+    return ("+".join(found), meta)
+
+
+def load_frame_map(dump_dir):
+    """game frame index -> capture index.
+
+    Inverted deliberately. The capture index is a counter of what this run
+    managed to drain and is not comparable across runs; the game frame index is
+    the engine's own clock and is.
+    """
+    path = os.path.join(dump_dir, "frames.csv")
+    if not os.path.exists(path):
+        return None
+    out = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            capture, frame = int(parts[0]), int(parts[1])
+            out[frame] = capture
+    return out
+
+
+def blob_hash(dump_dir, prefix, capture_index):
+    path = os.path.join(dump_dir, f"{prefix}_{capture_index:05d}.bin")
+    if not os.path.exists(path):
+        return None, 0
+    with open(path, "rb") as f:
+        data = f.read()
+    return hashlib.sha256(data).hexdigest(), len(data)
+
+
+def diff_metadata(before, after):
+    """Returns a list of human-readable differences."""
+    (before_src, before_meta) = before
+    (after_src, after_meta) = after
+    problems = []
+    if before_meta is None or after_meta is None:
+        problems.append(
+            f"metadata missing: before={before_src or 'NONE'} after={after_src or 'NONE'}")
+        return problems
+    if before_src != after_src:
+        problems.append(f"metadata format changed: {before_src} -> {after_src}")
+        # Not fatal on its own - Phase 4 does exactly this deliberately - but the
+        # dicts below will not be comparable, so stop here rather than emit noise.
+        return problems
+    if not isinstance(before_meta, dict) or not isinstance(after_meta, dict):
+        return problems
+    for key in sorted(set(before_meta) | set(after_meta)):
+        b, a = before_meta.get(key), after_meta.get(key)
+        if b != a:
+            problems.append(f"  {key}: {b!r} -> {a!r}")
+    return problems
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("before")
+    parser.add_argument("after")
+    parser.add_argument(
+        "--min-common", type=int, default=25,
+        help="fewest shared game frames for the comparison to mean anything (default 25)")
+    args = parser.parse_args()
+
+    for d in (args.before, args.after):
+        if not os.path.isdir(d):
+            print(f"FAIL - not a directory: {d}")
+            return 1
+
+    print(f"before: {args.before}")
+    print(f"after:  {args.after}")
+    print()
+
+    # --- metadata: must match exactly ---------------------------------------
+    meta_problems = diff_metadata(load_metadata(args.before), load_metadata(args.after))
+    if meta_problems:
+        print("METADATA DIFFERS:")
+        for p in meta_problems:
+            print(p)
+    else:
+        print("metadata: identical")
+
+    # --- frame maps ---------------------------------------------------------
+    before_map = load_frame_map(args.before)
+    after_map = load_frame_map(args.after)
+    if before_map is None or after_map is None:
+        print("FAIL - frames.csv missing; there is no way to line up frames between runs "
+              "without it, and comparing by capture index would compare different game frames.")
+        return 1
+
+    common = sorted(set(before_map) & set(after_map))
+    print(f"frames: before={len(before_map)} after={len(after_map)} common={len(common)}")
+    if common:
+        print(f"        game frame range: before {min(before_map)}..{max(before_map)}, "
+              f"after {min(after_map)}..{max(after_map)}")
+    print()
+
+    # --- content on the intersection ----------------------------------------
+    content_ok = True
+    any_surface = False
+    for name, prefix in SURFACES:
+        identical = differing = missing_before = missing_after = 0
+        first_diff = None
+        for frame in common:
+            hb, nb = blob_hash(args.before, prefix, before_map[frame])
+            ha, na = blob_hash(args.after, prefix, after_map[frame])
+            if hb is None and ha is None:
+                continue
+            if hb is None:
+                missing_before += 1
+                continue
+            if ha is None:
+                missing_after += 1
+                continue
+            if hb == ha:
+                identical += 1
+            else:
+                differing += 1
+                if first_diff is None:
+                    first_diff = (frame, nb, na)
+        if identical == differing == missing_before == missing_after == 0:
+            continue  # surface not present in either dump
+        any_surface = True
+
+        status = "ok" if (differing == 0 and missing_before == 0 and missing_after == 0) else "DIFFERS"
+        print(f"{name:9s} {status:8s} identical={identical:4d} differing={differing:4d} "
+              f"only-in-after={missing_before:3d} only-in-before={missing_after:3d}")
+        if first_diff:
+            frame, nb, na = first_diff
+            print(f"          first difference at game frame {frame}: "
+                  f"{nb} bytes before, {na} bytes after")
+        if status == "DIFFERS":
+            content_ok = False
+
+    if not any_surface:
+        print("FAIL - no surface blobs found in either dump")
+        return 1
+
+    print()
+    # --- verdict ------------------------------------------------------------
+    if meta_problems or not content_ok:
+        print("RESULT: DIFFERENT - this change altered the dump.")
+        return 1
+    if len(common) < args.min_common:
+        print(f"RESULT: WEAK - equivalent on {len(common)} shared game frames, which is fewer "
+              f"than --min-common={args.min_common}. That is not enough to conclude much; "
+              f"re-run with more frames rather than treating this as a pass.")
+        return 2
+    print(f"RESULT: EQUIVALENT - metadata identical, and all {len(common)} shared game frames "
+          f"byte-identical across every surface.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
