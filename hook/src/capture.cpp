@@ -373,9 +373,30 @@ struct DumpLayout
 {
     D3D12_RESOURCE_DESC desc{};
     bool known = false;
+    // Snapshotted once, the first time this surface is established for the
+    // dump - see SnapshotDumpLayout. Empty until then.
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
+    UINT64 bytes = 0;
+    UINT subresources = 0;
 };
 
 DumpLayout g_dumpLayout[kMaxSurfaces];
+
+// Records the derived layout (footprints, byte count, subresource count) the
+// first time a surface's readback is established for this dump - a no-op on
+// every later call, since DumpLayoutAccepts already refuses any layout that
+// would make this stale. Caller must hold g_mutex.
+void SnapshotDumpLayout(int surface, const SurfaceCapture& capture)
+{
+    DumpLayout& tracked = g_dumpLayout[surface];
+    if (!tracked.footprints.empty())
+    {
+        return;
+    }
+    tracked.footprints = capture.footprints;
+    tracked.bytes = capture.bytes;
+    tracked.subresources = capture.subresources;
+}
 
 // Caller must hold g_mutex. Records the layout the first time a surface is
 // seen; afterwards returns false - having already ended the burst - if it has
@@ -1212,9 +1233,14 @@ void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velo
         return;
     }
     SurfaceCapture& surface = slot->surfaces[kSurfaceVelocity];
+    const bool firstVelocityUse = surface.readback == nullptr;
     if (!EnsureReadback(surface, kSurfaceVelocity, desc))
     {
         return;
+    }
+    if (firstVelocityUse)
+    {
+        SnapshotDumpLayout(kSurfaceVelocity, surface);
     }
 
     RecordCopyToReadback(
@@ -1297,9 +1323,13 @@ void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, 
     {
         return;
     }
-    if (firstUse && !g_depthMetadataWritten.exchange(true))
+    if (firstUse)
     {
-        WriteDepthMetadata(*slot);
+        SnapshotDumpLayout(kSurfaceDepth, surface);
+        if (!g_depthMetadataWritten.exchange(true))
+        {
+            WriteDepthMetadata(*slot);
+        }
     }
 
     RecordCopyToReadback(
@@ -1562,9 +1592,13 @@ void OnPresent(IDXGISwapChain* swapChain)
     {
         return;
     }
-    if (firstColorUse && !g_metadataWritten.exchange(true))
+    if (firstColorUse)
     {
-        WriteMetadata(*slot);
+        SnapshotDumpLayout(kSurfaceColor, color);
+        if (!g_metadataWritten.exchange(true))
+        {
+            WriteMetadata(*slot);
+        }
     }
 
     // The fence signalled below covers the velocity copy only if the game has
