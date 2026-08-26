@@ -268,6 +268,61 @@ void ArmBurst()
     g_burstArmed.store(true, std::memory_order_relaxed);
 }
 
+// The four ways a burst's g_framesRemaining reaches zero. Recorded with
+// compare_exchange against NotEnded at each site (see EndBurst below), so
+// whichever condition fires first for a given burst-arm cycle is what gets
+// remembered - correct regardless of which check happens to run first in
+// OnPresent, or whether more than one would fire in the same call.
+enum class BurstEndReason : uint8_t
+{
+    NotEnded,
+    Completed,                // reached the requested frame count
+    LayoutChanged,             // a surface's layout changed mid-dump
+    VelocityPassSilent,        // the velocity pass stopped rendering
+    PresentBudgetExhausted,    // kBurstPresentBudget Presents spent
+};
+std::atomic<BurstEndReason> g_burstEndReason{BurstEndReason::NotEnded};
+
+// Zeroes g_framesRemaining and records why, if nothing already has. Returns
+// how many requested frames were never captured, same as the raw exchange
+// callers used before this existed - kept so every call site's own Log()
+// line is unchanged.
+int EndBurst(BurstEndReason reason)
+{
+    BurstEndReason expected = BurstEndReason::NotEnded;
+    g_burstEndReason.compare_exchange_strong(expected, reason, std::memory_order_relaxed);
+    return g_framesRemaining.exchange(0, std::memory_order_relaxed);
+}
+
+// True once nothing that belongs to the current (or most recently ended)
+// burst is still in flight: no frames left to record AND no slot waiting on
+// a fence. This is the "safe to seal the dump directory" signal - see the
+// header comment above for why it is not simply "g_framesRemaining == 0".
+// Caller must hold g_mutex (reads Slot::state).
+bool DumpFullyDrained()
+{
+    if (g_framesRemaining.load(std::memory_order_relaxed) > 0)
+    {
+        return false;
+    }
+    for (const Slot& slot : g_slots)
+    {
+        if (slot.state == SlotState::Submitted)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Set whenever a burst is armed; cleared once DumpFullyDrained() has been
+// observed true and the (Phase 4c) manifest write for it has been enqueued.
+// Two bursts into the same MV_DUMP_DIR share this flag exactly like they
+// already share meta.txt - a second burst re-dirties it, and the eventual
+// seal reflects the cumulative state of the whole directory, not just the
+// latest burst.
+std::atomic<bool> g_manifestDirty{false};
+
 // Frames skipped because every ring slot was in flight. Diagnostic only -
 // distinguishes "ring busy as designed" from "ring wedged".
 std::atomic<uint64_t> g_noFreeSlot{0};
@@ -341,7 +396,7 @@ bool DumpLayoutAccepts(int surface, const D3D12_RESOURCE_DESC& desc)
     {
         return true;
     }
-    const int short_by = g_framesRemaining.exchange(0, std::memory_order_relaxed);
+    const int short_by = EndBurst(BurstEndReason::LayoutChanged);
     Log(std::string("capture: burst ENDED - the ") + name + " layout changed, " + DescToString(tracked.desc) + " -> " +
         DescToString(desc) + ". This dump's meta.txt describes the first layout and the format has nowhere to record "
         "a second, so continuing would write frames that every offline tool un-pads at the wrong row pitch - "
@@ -381,6 +436,11 @@ bool g_writerStop = false;
 std::thread g_writerThread;
 std::atomic<uint64_t> g_droppedWrites{0};
 std::atomic<uint64_t> g_droppedFrames{0};
+// Frames that actually reached the write queue, as opposed to g_captureCounter
+// (which counts slots that reached Submitted - a copy recorded on the GPU,
+// not yet proven written). Phase 4c's manifest reports this as
+// burst.drained_frames.
+std::atomic<uint64_t> g_drainedFrames{0};
 
 std::string DumpDir()
 {
@@ -936,8 +996,12 @@ bool DrainSlot(Slot& slot)
                                  /*append=*/true});
     }
 
-    const bool queued = EnqueueFrame(std::move(jobs));
-    return queued && haveVelocity && haveColor;
+    const bool ok = EnqueueFrame(std::move(jobs)) && haveVelocity && haveColor;
+    if (ok)
+    {
+        g_drainedFrames.fetch_add(1, std::memory_order_relaxed);
+    }
+    return ok;
 }
 
 } // namespace
@@ -1332,6 +1396,8 @@ void OnPresent(IDXGISwapChain* swapChain)
     {
         g_framesRemaining.store(kCaptureFrames);
         g_burstPresentsLeft.store(kBurstPresentBudget);
+        g_burstEndReason.store(BurstEndReason::NotEnded, std::memory_order_relaxed);
+        g_manifestDirty.store(true, std::memory_order_relaxed);
     }
 
     // End the burst if the game has stopped rendering the velocity pass -
@@ -1342,7 +1408,7 @@ void OnPresent(IDXGISwapChain* swapChain)
         uint64_t silentFor = 0;
         if (g_framesRemaining.load(std::memory_order_relaxed) > 0 && VelocityPassIsSilent(presented, &silentFor))
         {
-            const int short_by = g_framesRemaining.exchange(0, std::memory_order_relaxed);
+            const int short_by = EndBurst(BurstEndReason::VelocityPassSilent);
             Log("capture: burst ENDED - the game has not rendered the velocity pass for " + std::to_string(silentFor) +
                 " frames, so there is nothing left to capture. " + std::to_string(short_by) + " of the requested " +
                 std::to_string(kCaptureFrames) +
@@ -1357,7 +1423,7 @@ void OnPresent(IDXGISwapChain* swapChain)
     if (g_framesRemaining.load(std::memory_order_relaxed) > 0 &&
         g_burstPresentsLeft.fetch_sub(1, std::memory_order_relaxed) <= 1)
     {
-        const int short_by = g_framesRemaining.exchange(0, std::memory_order_relaxed);
+        const int short_by = EndBurst(BurstEndReason::PresentBudgetExhausted);
         Log("capture: burst ENDED short - " + std::to_string(kBurstPresentBudget) + " frames presented and " +
             std::to_string(short_by) + " of the requested " + std::to_string(kCaptureFrames) +
             " never landed. The dump has what did. Ending rather than waiting: a burst that "
@@ -1377,6 +1443,22 @@ void OnPresent(IDXGISwapChain* swapChain)
                 slot.state = SlotState::Free;
             }
         }
+    }
+
+    // 1b. Seal the dump directory once nothing from this (or an earlier,
+    // still-draining) burst is left in flight. Placed right after the drain
+    // loop above, which is what can make DumpFullyDrained() newly true.
+    //
+    // TODO(Phase 4c): replace this log line with the atomic manifest.json
+    // write it stands in for (docs/REFACTOR_PLAN.md sec 4.1).
+    if (g_manifestDirty.load(std::memory_order_relaxed) && DumpFullyDrained())
+    {
+        static const char* const kReasonNames[] = {
+            "not_ended", "completed", "layout_changed", "velocity_pass_silent", "present_budget_exhausted"};
+        const BurstEndReason reason = g_burstEndReason.load(std::memory_order_relaxed);
+        Log("capture: dump directory sealed - " + std::to_string(g_drainedFrames.load(std::memory_order_relaxed)) +
+            " frame(s) drained, ended_because=" + kReasonNames[static_cast<int>(reason)]);
+        g_manifestDirty.store(false, std::memory_order_relaxed);
     }
 
     // 2. Reclaim slots whose Present never arrived (abandoned frame,
@@ -1574,6 +1656,12 @@ void OnPresent(IDXGISwapChain* swapChain)
     const int remaining = g_framesRemaining.fetch_sub(1) - 1;
     if (remaining <= 0)
     {
+        // No-op if an early-end site already recorded a reason this same
+        // burst; otherwise this frame is what finally exhausted the
+        // requested count.
+        BurstEndReason expectedReason = BurstEndReason::NotEnded;
+        g_burstEndReason.compare_exchange_strong(
+            expectedReason, BurstEndReason::Completed, std::memory_order_relaxed);
         // "Recorded" is the honest word: last frames may still be in flight
         // on the GPU, and drained frames are only queued for the writer, not
         // necessarily on disk yet. Only ShutdownCapture guarantees that.
