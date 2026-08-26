@@ -88,4 +88,18 @@ bool IsCandidate(ID3D12Resource* resource);
 // false if the candidate is gone or no longer matches.
 bool ValidateCandidate(ID3D12Resource* resource);
 
+// Drops every candidate.
+//
+// Must be called by anything that reopens a search, because THIS set - not the
+// identifier's own g_identified pointer - is what the barrier hook gates
+// capture on (see IsCandidate in d3d12_hook.cpp). Leaving entries in it means
+// "the search reopened" does not mean "we stopped capturing", which is exactly
+// what happened on the back-buffer-resize path: UE abandons the velocity
+// texture rather than resizing it, so the abandoned resource's own descriptor
+// stays valid, ValidateCandidate keeps passing, and copies kept being recorded
+// from a texture the engine was no longer rendering into - for the whole
+// duration of a search that logged "Nothing is captured until a new decision is
+// reached".
+void ForgetAllCandidates();
+
 } // namespace mv

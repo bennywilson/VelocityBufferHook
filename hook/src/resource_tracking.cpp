@@ -177,4 +177,21 @@ bool ValidateCandidate(ID3D12Resource* resource) {
     return false;
 }
 
+void ForgetAllCandidates() {
+    size_t dropped = 0;
+    {
+        std::unique_lock lock(g_candidateMutex);
+        dropped = g_candidateResources.size();
+        // Releases the reference each candidate is held by, which is the point:
+        // past this line nothing keeps an abandoned resource's address reserved,
+        // and IsCandidate() answers false until a new decision marks one.
+        g_candidateResources.clear();
+    }
+    if (dropped != 0) {
+        Log("resource-tracking: dropped " + std::to_string(dropped) +
+            " candidate(s) because a search reopened - capture stops here and does not resume until a "
+            "new decision is reached");
+    }
+}
+
 } // namespace mv

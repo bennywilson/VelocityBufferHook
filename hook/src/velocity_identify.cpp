@@ -925,6 +925,19 @@ void ReopenIdentification(const char* reason)
     // resource in the process is already marked and NoteResourceDesc would
     // never be reached again.
     ForgetAllResourcesSeen();
+    // Clearing g_identified above is NOT what stops capture - the barrier hook
+    // gates on IsCandidate(), a separate set this function used to leave alone.
+    // On the two paths where ValidateCandidate failed that was survivable,
+    // because ValidateCandidate erases the entry itself before calling here. On
+    // the back-buffer-resize path nothing erased it and nothing ever would: UE
+    // abandons the velocity texture at the old extent rather than resizing it,
+    // so its descriptor stays valid, ValidateCandidate keeps passing, and we
+    // kept copying from an abandoned texture for the entire reopened search -
+    // while the line above said we were not capturing at all. Worse, once the
+    // new search resolved, MarkAsCandidate ADDED to the set rather than
+    // replacing it, leaving both resources marked and making the outcome
+    // first-edge-wins rather than correct-resource-wins.
+    ForgetAllCandidates();
 }
 
 bool VelocityPassIsSilent(uint64_t frame, uint64_t* framesSilent)
