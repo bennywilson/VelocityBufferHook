@@ -8,6 +8,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <cassert>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -78,6 +79,35 @@ constexpr int kSurfaceColor = 2;
 constexpr int kSurfaceCount = 3;
 static_assert(kSurfaceCount <= kMaxSurfaces, "surface count outgrew the fixed array");
 
+// Whether a surface's identity is FOUND (structural + behavioural search) or
+// GIVEN (a documented API contract names the exact resource, so there is
+// nothing to search for). Two states, not a spectrum: docs/REFACTOR_PLAN.md
+// sec 3.1 is explicit that a surface may claim KnownByConstruction only when
+// an API contract names it, and colour is the only surface in D3D12 that
+// qualifies - there is no GetVelocityBuffer(), no GetSceneDepth().
+//
+// This is a closed enum, not a free-form flag, and deliberately carries no
+// "assume" or "skip the gate" option: a profile can SELECT
+// KnownByConstruction for a surface that already has one (there is exactly
+// one candidate today, below), but adding a second is a code change, not a
+// config change (sec 2.8 - a profile may narrow/widen/reweight a search, it
+// may never assert an identity outright).
+enum class SourceKind : uint8_t
+{
+    Identified,
+    KnownByConstruction
+};
+
+// The specific API contract, when SourceKind::KnownByConstruction applies.
+// Meaningless otherwise - kept as its own enum rather than a bool so a second
+// known source (there is none today) does not have to overload this one's
+// meaning.
+enum class KnownSource : uint8_t
+{
+    None,
+    SwapChainBackBuffer
+};
+
 // The data-only half of a surface's description: scalars and names, no state,
 // nothing that survives a call. That is what will let it come out of a JSON
 // profile later without changing shape.
@@ -89,15 +119,19 @@ struct SurfaceSpec
     // worth stating once, kept as data rather than as a branch inside the
     // shared path that writes them.
     const char* note;
+    SourceKind source;
+    KnownSource known; // meaningful only when source == KnownByConstruction
 };
 
 constexpr SurfaceSpec kSurfaceSpecs[kSurfaceCount] = {
-    {"velocity", "vel", ""},
+    {"velocity", "vel", "", SourceKind::Identified, KnownSource::None},
     {"depth",
      "depth",
      " (plane count comes from the desc: a D24S8 or D32S8 depth buffer is two planes, and copying only the "
-     "first would silently truncate it)"},
-    {"back buffer", "color", ""},
+     "first would silently truncate it)",
+     SourceKind::Identified,
+     KnownSource::None},
+    {"back buffer", "color", "", SourceKind::KnownByConstruction, KnownSource::SwapChainBackBuffer},
 };
 
 // How well the fence covers a surface's copy.
@@ -1505,6 +1539,17 @@ void OnPresent(IDXGISwapChain* swapChain)
     // Our list, our submit, immediately before the Signal below - so there is
     // nothing to check and nothing that could make it stale. Recorded as its
     // own value rather than a Strong that would mean something different.
+    //
+    // The assert is the tie between two facts that happen to coincide for
+    // colour today but are not the same fact: SourceKind says WHERE the
+    // resource's identity came from (an API contract vs. a search),
+    // Coverage says whether the FENCE covers this particular copy. Nothing
+    // stops a future KnownByConstruction surface from riding a command list
+    // it did not submit itself and needing real coverage grading - if that
+    // ever happens, this line is where it would need to change, and the
+    // assert is what makes silently forgetting to change it loud instead of
+    // quiet.
+    assert(kSurfaceSpecs[kSurfaceColor].source == SourceKind::KnownByConstruction);
     color.coverage = Coverage::ByConstruction;
     ++color.copies;
     color.present = true;
