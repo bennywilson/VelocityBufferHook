@@ -393,8 +393,33 @@ void ReopenDepthIdentification(const char* reason)
     g_decisionMade.store(false, std::memory_order_relaxed);
     g_decideAtFrame.store(0, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_shortlist.clear();
-    g_profiles.clear();
+
+    // The shortlist and the profile KEYS are kept; only the counters are reset.
+    //
+    // Clearing them was a dead end. The shortlist is refilled from exactly one
+    // place - NoteResourceDescForDepth - which the barrier hook reaches only
+    // when TryMarkResourceSeen() accepts the resource, and that set still holds
+    // every resource seen before this reopen. Velocity's reopen clears it
+    // (ForgetAllResourcesSeen); this one does not, and must not: clearing it
+    // would re-feed every live resource to the VELOCITY search, whose
+    // shortlist has no duplicate check, and two identical survivors score an
+    // identical margin of zero - a permanent AMBIGUOUS.
+    //
+    // So a cleared depth shortlist could only ever be refilled by resources the
+    // engine happened to allocate AFTER the reopen. On a session where that did
+    // not happen, depth was lost for good while this function logged that it had
+    // reopened - intermittent, which is worse than reproducible.
+    //
+    // Resetting in place keeps the candidates and starts a fresh measurement
+    // window, which is what velocity's own retry does (see the profile reset in
+    // velocity_identify.cpp's Decide). Stale entries are not a risk: Decide()
+    // re-reads GetDesc() and re-runs both the structural gate and the extent
+    // test on every candidate, so a resource that no longer qualifies is
+    // rejected there.
+    for (auto& entry : g_profiles)
+    {
+        entry.second = DepthProfile{};
+    }
 }
 
 ID3D12Resource* IdentifiedDepthResource()
