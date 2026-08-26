@@ -485,6 +485,58 @@ bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = fal
     return true;
 }
 
+// Enqueues every blob belonging to one frame - plus its frames.csv line, when
+// present - as a single atomic unit: all of them land in the write queue
+// together, under one hold of g_writeMutex, or none do.
+//
+// Before this, each surface's blob went through its own EnqueueWrite call,
+// each re-checking the queue budget independently. That could not actually
+// drop only part of a frame - DrainSlot has exactly one caller (OnPresent,
+// itself called only while g_mutex is held), so nothing else can grow the
+// queue between one blob's check and the next - but the code did not SAY
+// that; it relied on a reader noticing and preserving an invariant nothing
+// enforced. This makes the partial case impossible to express instead of
+// merely absent in practice.
+//
+// Returns false if the whole frame was dropped for backpressure. Given the
+// size-before-map check in DrainSlot, this recheck should never actually
+// fail - but the return value stays honest rather than assumed.
+bool EnqueueFrame(std::vector<WriteJob> jobs)
+{
+    size_t total = 0;
+    for (const WriteJob& job : jobs)
+    {
+        total += job.data.size();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_writeMutex);
+        if (g_writerStop)
+        {
+            return false;
+        }
+        if (!g_writerStarted)
+        {
+            g_writerStarted = true;
+            g_writerThread = std::thread(WriterThread);
+        }
+        if (g_queuedBytes + total > kMaxQueuedBytes)
+        {
+            const uint64_t n = g_droppedWrites.fetch_add(jobs.size()) + jobs.size();
+            Log("capture: WRITE QUEUE FULL (" + std::to_string(g_queuedBytes / (1024 * 1024)) +
+                "MB pending), dropping " + std::to_string(jobs.size()) + " blob(s) for one frame (" +
+                std::to_string(total / (1024 * 1024)) + "MB) - dropped " + std::to_string(n) + " so far");
+            return false;
+        }
+        g_queuedBytes += total;
+        for (WriteJob& job : jobs)
+        {
+            g_writeQueue.push_back(std::move(job));
+        }
+    }
+    g_writeCv.notify_one();
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 
 // Creates a READBACK-heap resource of the given size.
@@ -766,6 +818,30 @@ bool MapOut(ID3D12Resource* buffer, UINT64 bytes, std::vector<uint8_t>& out)
 // with nothing distinguishing that from "never identified".
 bool DrainSlot(Slot& slot)
 {
+    // Byte counts are already known from GetCopyableFootprints (see
+    // EnsureReadback), so the room check runs BEFORE any Map() call rather
+    // than after. A frame that cannot fit is dropped before its ~19MB is
+    // memcpy'd out of GPU-visible memory for nothing - see
+    // docs/REFACTOR_PLAN.md finding 1.3.
+    size_t total = 0;
+    for (int i = 0; i < kSurfaceCount; ++i)
+    {
+        if (slot.surfaces[i].present)
+        {
+            total += slot.surfaces[i].bytes;
+        }
+    }
+    if (!WriteQueueHasRoom(total))
+    {
+        const uint64_t n = g_droppedFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+        Log("capture: write queue has no room for frame " + std::to_string(slot.captureIndex) + " (" +
+            std::to_string(total / (1024 * 1024)) + "MB) - dropping the WHOLE frame BEFORE mapping anything, " +
+            std::to_string(n) +
+            " so far. A partial frame would be worse: nothing in the dump distinguishes 'depth was "
+            "dropped here' from 'depth was never captured at all'.");
+        return false;
+    }
+
     // Velocity and the back buffer are what every downstream tool keys off, so
     // a slot without both is not a capture. Kept explicit rather than folded
     // into the loop because those two are load-bearing in a way the others are
@@ -793,26 +869,14 @@ bool DrainSlot(Slot& slot)
         mapped[i] = MapOut(slot.surfaces[i].readback.Get(), slot.surfaces[i].bytes, data[i]);
     }
 
-    size_t total = 0;
-    for (int i = 0; i < kSurfaceCount; ++i)
-    {
-        total += data[i].size();
-    }
-    if (!WriteQueueHasRoom(total))
-    {
-        const uint64_t n = g_droppedFrames.fetch_add(1, std::memory_order_relaxed) + 1;
-        Log("capture: write queue has no room for frame " + std::to_string(slot.captureIndex) + " (" +
-            std::to_string(total / (1024 * 1024)) + "MB) - dropping the WHOLE frame, " + std::to_string(n) +
-            " so far. A partial frame would be worse: nothing in the dump distinguishes 'depth was "
-            "dropped here' from 'depth was never captured at all'.");
-        return false;
-    }
-
-    // One loop, so a fourth surface is a table entry rather than another
-    // hand-written EnqueueWrite whose result someone forgets to check - as
-    // depth's was.
+    // Every mapped blob, plus the frames.csv line, is handed to EnqueueFrame
+    // together - one atomic unit, so a fourth surface is a table entry here
+    // and nowhere gets to enqueue only part of a frame.
     char nameBuf[64]{};
-    bool written[kMaxSurfaces] = {};
+    std::vector<WriteJob> jobs;
+    jobs.reserve(kSurfaceCount + 1);
+    bool haveVelocity = false;
+    bool haveColor = false;
     for (int i = 0; i < kSurfaceCount; ++i)
     {
         if (!mapped[i])
@@ -820,23 +884,26 @@ bool DrainSlot(Slot& slot)
             continue;
         }
         sprintf_s(nameBuf, "%s_%05d.bin", kSurfaceSpecs[i].filePrefix, slot.captureIndex);
-        written[i] = EnqueueWrite(DumpDir() + nameBuf, std::move(data[i]));
+        jobs.push_back(WriteJob{DumpDir() + nameBuf, std::move(data[i]), /*append=*/false});
+        haveVelocity = haveVelocity || i == kSurfaceVelocity;
+        haveColor = haveColor || i == kSurfaceColor;
     }
-    const bool velOk = written[kSurfaceVelocity];
-    const bool colorOk = written[kSurfaceColor];
 
     // Records which GAME frame this capture came from. Capture indices just
     // count what we drained, so adjacent indices aren't necessarily adjacent
     // frames (busy slot, dropped write, second burst) - warp validation needs
-    // N-1/N to actually be one frame apart. Written only when both halves of
-    // the pair made it to disk.
-    if (velOk && colorOk)
+    // N-1/N to actually be one frame apart. Included only when both halves of
+    // the pair are part of this same atomic enqueue.
+    if (haveVelocity && haveColor)
     {
         char line[64]{};
         sprintf_s(line, "%d,%llu\n", slot.captureIndex, slot.frameIndex);
-        EnqueueWrite(DumpDir() + "frames.csv", std::vector<uint8_t>(line, line + strlen(line)), /*append=*/true);
+        jobs.push_back(WriteJob{DumpDir() + "frames.csv", std::vector<uint8_t>(line, line + strlen(line)),
+                                 /*append=*/true});
     }
-    return velOk && colorOk;
+
+    const bool queued = EnqueueFrame(std::move(jobs));
+    return queued && haveVelocity && haveColor;
 }
 
 } // namespace
