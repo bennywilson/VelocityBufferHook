@@ -52,41 +52,109 @@ enum class SlotState
     Submitted
 };
 
+// ---------------------------------------------------------------------------
+// Surfaces.
+//
+// A Surface is one per-frame image the dump carries. Deliberately not called a
+// "plane", "resource" or "buffer": all three already mean something else here
+// (ID3D12Resource, D3D12_RESOURCE_DIMENSION_BUFFER, and D3D12's own
+// depth/stencil subresource PLANES, which live inside a Surface and keep that
+// word).
+//
+// This replaces five field sets that were triplicated across Slot by hand -
+// buffer, footprints, desc, bytes, subresources - plus six more that existed
+// for one surface each (four of them velocity's, one depth's, none colour's).
+// Adding a fourth surface meant editing eleven places, and a forgotten one
+// degraded silently. See docs/REFACTOR_PLAN.md.
+//
+// A fixed array rather than the std::vector the plan sketched: the count is
+// known at compile time until profiles arrive (Phase 9), and an array keeps
+// "no allocation on the hot path" true by construction rather than by
+// remembering to reserve.
+constexpr int kMaxSurfaces = 8;
+constexpr int kSurfaceVelocity = 0;
+constexpr int kSurfaceDepth = 1;
+constexpr int kSurfaceColor = 2;
+constexpr int kSurfaceCount = 3;
+static_assert(kSurfaceCount <= kMaxSurfaces, "surface count outgrew the fixed array");
+
+// The data-only half of a surface's description: scalars and names, no state,
+// nothing that survives a call. That is what will let it come out of a JSON
+// profile later without changing shape.
+struct SurfaceSpec
+{
+    const char* name;       // for logs
+    const char* filePrefix; // dump filename stem, as in vel_00001.bin
+    // Appended to this surface's readback-creation log line. Per-surface facts
+    // worth stating once, kept as data rather than as a branch inside the
+    // shared path that writes them.
+    const char* note;
+};
+
+constexpr SurfaceSpec kSurfaceSpecs[kSurfaceCount] = {
+    {"velocity", "vel", ""},
+    {"depth",
+     "depth",
+     " (plane count comes from the desc: a D24S8 or D32S8 depth buffer is two planes, and copying only the "
+     "first would silently truncate it)"},
+    {"back buffer", "color", ""},
+};
+
+// How well the fence covers a surface's copy.
+//
+//   Strong         - the exact recorded command list was seen submitted to the
+//                    fenced queue.
+//   Weak           - list identity wasn't observable (e.g. under the debug
+//                    layer's wrapper), but the queue did submit after
+//                    recording. Consistent, not proven.
+//   None           - nothing submitted in between; readback is unsafe.
+//   ByConstruction - the copy was recorded on OUR list and submitted by US
+//                    immediately before the Signal, so there is nothing to
+//                    check. This is the back buffer, and it is a distinct
+//                    value rather than a Strong that would mean something
+//                    materially different.
+enum class Coverage : uint8_t
+{
+    None,
+    Weak,
+    Strong,
+    ByConstruction
+};
+
+// One surface's per-slot capture state.
+struct SurfaceCapture
+{
+    ComPtr<ID3D12Resource> readback;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
+    // Desc the footprints were derived from; compared every frame since
+    // footprints are only valid for the exact layout they came from.
+    D3D12_RESOURCE_DESC desc{};
+    UINT64 bytes = 0;
+    UINT subresources = 0;
+    int copies = 0;
+    // Replaces hasVelocity/hasDepth - and gives the back buffer the flag it
+    // never had, where presence was implied by MapOut happening to succeed.
+    bool present = false;
+    // Identity of the command list this copy was recorded onto. Used only as a
+    // key to check submission - never dereferenced, we hold no ref. This was a
+    // single field on Slot that only the velocity path ever set, which is why
+    // depth's fence coverage has never actually been evaluated.
+    IUnknown* recordedList = nullptr;
+    // Submission count on our queue at the moment the copy was recorded, for
+    // the ordering-based fallback when list identity is not observable.
+    uint64_t queueSubmissionsAtRecord = 0;
+    Coverage coverage = Coverage::None;
+};
+
 struct Slot
 {
-    ComPtr<ID3D12Resource> velocityBuffer;
-    ComPtr<ID3D12Resource> colorBuffer;
-    ComPtr<ID3D12Resource> depthBuffer;
     ComPtr<ID3D12CommandAllocator> allocator;
     ComPtr<ID3D12GraphicsCommandList> commandList;
-    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> velocityFootprints;
-    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> colorFootprints;
-    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> depthFootprints;
-    // Descs the footprints were derived from; compared every frame since
-    // footprints are only valid for the exact layout they came from.
-    D3D12_RESOURCE_DESC velocityDesc{};
-    D3D12_RESOURCE_DESC colorDesc{};
-    D3D12_RESOURCE_DESC depthDesc{};
-    UINT64 velocityBytes = 0;
-    UINT64 colorBytes = 0;
-    UINT64 depthBytes = 0;
-    UINT velocitySubresources = 0;
-    UINT colorSubresources = 0;
-    UINT depthSubresources = 0;
+    SurfaceCapture surfaces[kMaxSurfaces];
     UINT64 fenceValue = 0;
     unsigned long long frameIndex = 0;
     int captureIndex = 0;
     SlotState state = SlotState::Free;
-    bool hasVelocity = false;
-    bool hasDepth = false;
-    int depthCopies = 0;
-    // Identity of the command list the velocity copy was recorded onto. Used
-    // only as a key to check submission - never dereferenced, we hold no ref.
-    IUnknown* recordedList = nullptr;
-    bool velocitySubmitted = false;
-    // Submission count on our queue at the moment the copy was recorded, for
-    // the ordering-based fallback when list identity is not observable.
-    uint64_t queueSubmissionsAtRecord = 0;
 };
 
 // Canonical COM identity: QueryInterface(IID_IUnknown) is the only pointer
@@ -218,18 +286,16 @@ struct DumpLayout
     bool known = false;
 };
 
-constexpr int kSurfaceVelocity = 0;
-constexpr int kSurfaceDepth = 1;
-constexpr int kSurfaceColor = 2;
-DumpLayout g_dumpLayout[3];
+DumpLayout g_dumpLayout[kMaxSurfaces];
 
 // Caller must hold g_mutex. Records the layout the first time a surface is
 // seen; afterwards returns false - having already ended the burst - if it has
 // changed. Deliberately NOT reset when a new burst is armed: two bursts into
 // one dump directory share one meta.txt, so the constraint is per dump, not
 // per burst.
-bool DumpLayoutAccepts(int surface, const char* name, const D3D12_RESOURCE_DESC& desc)
+bool DumpLayoutAccepts(int surface, const D3D12_RESOURCE_DESC& desc)
 {
+    const char* name = kSurfaceSpecs[surface].name;
     DumpLayout& tracked = g_dumpLayout[surface];
     if (!tracked.known)
     {
@@ -488,6 +554,51 @@ UINT SubresourceCountFor(ID3D12Device* device, const D3D12_RESOURCE_DESC& desc)
     return mips * slices * PlaneCountFor(device, desc.Format);
 }
 
+// Makes sure a surface has a readback buffer matching `desc`, rebuilding its
+// footprints if the layout changed or this is the slot's first use.
+//
+// Footprints are only valid for the exact layout they were derived from, so the
+// desc is compared every frame rather than trusted once: render resolution can
+// change mid-session (dynamic resolution scaling), and stale footprints would
+// silently corrupt the copy into plausible-looking garbage.
+//
+// This was three near-identical blocks, one per surface, differing only in
+// which Slot fields they touched and what they logged - which is why adding a
+// fourth surface meant transcribing it a fourth time.
+//
+// Returns false if the buffer could not be created, in which case nothing is
+// recorded for that surface this frame. Caller must hold g_mutex.
+bool EnsureReadback(SurfaceCapture& capture, int surface, const D3D12_RESOURCE_DESC& desc)
+{
+    if (capture.readback != nullptr && SameLayout(capture.desc, desc))
+    {
+        return true;
+    }
+    const SurfaceSpec& spec = kSurfaceSpecs[surface];
+    if (capture.readback != nullptr)
+    {
+        Log(std::string("capture: ") + spec.name + " layout changed, " + DescToString(capture.desc) + " -> " +
+            DescToString(desc) + "; rebuilding footprints");
+    }
+    const UINT subresources = SubresourceCountFor(g_device.Get(), desc);
+    capture.footprints.resize(subresources);
+    UINT64 total = 0;
+    g_device->GetCopyableFootprints(&desc, 0, subresources, 0, capture.footprints.data(), nullptr, nullptr, &total);
+    capture.bytes = total;
+    capture.subresources = subresources;
+    capture.desc = desc;
+    capture.readback.Reset();
+    if (!CreateReadbackBuffer(g_device.Get(), total, capture.readback))
+    {
+        Log(std::string("capture: failed to create ") + spec.name + " readback buffer");
+        return false;
+    }
+    Log(std::string("capture: ") + spec.name + " readback buffer created, " + std::to_string(total) + " bytes, " +
+        std::to_string(subresources) +
+        " subresource(s), rowPitch=" + std::to_string(capture.footprints[0].Footprint.RowPitch) + spec.note);
+    return true;
+}
+
 // Copies every subresource of a texture into a READBACK buffer, bracketed by
 // barriers that restore the resource's original state afterward.
 //
@@ -547,24 +658,26 @@ void WriteMetadata(const Slot& slot)
     // Both formats come from the descs the footprints were derived from, not
     // hardcoded - a widened identification filter would otherwise mislabel
     // the dump silently.
-    const DXGI_FORMAT velocityFormat = slot.velocityDesc.Format;
-    const DXGI_FORMAT colorFormat = slot.colorDesc.Format;
+    const SurfaceCapture& velocity = slot.surfaces[kSurfaceVelocity];
+    const SurfaceCapture& color = slot.surfaces[kSurfaceColor];
+    const DXGI_FORMAT velocityFormat = velocity.desc.Format;
+    const DXGI_FORMAT colorFormat = color.desc.Format;
     std::string meta;
     // Subresource 0 describes the top mip/first plane, which is what offline
     // tools read. Subresource count is reported too, so multi-plane/mipped
     // captures are self-describing.
-    meta += "velocity_width=" + std::to_string(slot.velocityFootprints[0].Footprint.Width) + "\n";
-    meta += "velocity_height=" + std::to_string(slot.velocityFootprints[0].Footprint.Height) + "\n";
-    meta += "velocity_row_pitch=" + std::to_string(slot.velocityFootprints[0].Footprint.RowPitch) + "\n";
+    meta += "velocity_width=" + std::to_string(velocity.footprints[0].Footprint.Width) + "\n";
+    meta += "velocity_height=" + std::to_string(velocity.footprints[0].Footprint.Height) + "\n";
+    meta += "velocity_row_pitch=" + std::to_string(velocity.footprints[0].Footprint.RowPitch) + "\n";
     meta += "velocity_format=" + std::to_string(static_cast<int>(velocityFormat)) + "\n";
-    meta += "velocity_bytes=" + std::to_string(slot.velocityBytes) + "\n";
-    meta += "velocity_subresources=" + std::to_string(slot.velocitySubresources) + "\n";
-    meta += "color_width=" + std::to_string(slot.colorFootprints[0].Footprint.Width) + "\n";
-    meta += "color_height=" + std::to_string(slot.colorFootprints[0].Footprint.Height) + "\n";
-    meta += "color_row_pitch=" + std::to_string(slot.colorFootprints[0].Footprint.RowPitch) + "\n";
+    meta += "velocity_bytes=" + std::to_string(velocity.bytes) + "\n";
+    meta += "velocity_subresources=" + std::to_string(velocity.subresources) + "\n";
+    meta += "color_width=" + std::to_string(color.footprints[0].Footprint.Width) + "\n";
+    meta += "color_height=" + std::to_string(color.footprints[0].Footprint.Height) + "\n";
+    meta += "color_row_pitch=" + std::to_string(color.footprints[0].Footprint.RowPitch) + "\n";
     meta += "color_format=" + std::to_string(static_cast<int>(colorFormat)) + "\n";
-    meta += "color_bytes=" + std::to_string(slot.colorBytes) + "\n";
-    meta += "color_subresources=" + std::to_string(slot.colorSubresources) + "\n";
+    meta += "color_bytes=" + std::to_string(color.bytes) + "\n";
+    meta += "color_subresources=" + std::to_string(color.subresources) + "\n";
     // Engine version the dump came from, recorded per capture so the offline
     // decode doesn't rely on a module-global default (which silently
     // mis-decodes the second of two dumps in a session). Matters because
@@ -609,13 +722,14 @@ void WriteMetadata(const Slot& slot)
 // and row pitches.
 void WriteDepthMetadata(const Slot& slot)
 {
+    const SurfaceCapture& depth = slot.surfaces[kSurfaceDepth];
     std::string meta;
-    meta += "depth_format=" + std::to_string(static_cast<int>(slot.depthDesc.Format)) + "\n";
-    meta += "depth_bytes=" + std::to_string(slot.depthBytes) + "\n";
-    meta += "depth_subresources=" + std::to_string(slot.depthSubresources) + "\n";
-    for (size_t i = 0; i < slot.depthFootprints.size(); ++i)
+    meta += "depth_format=" + std::to_string(static_cast<int>(depth.desc.Format)) + "\n";
+    meta += "depth_bytes=" + std::to_string(depth.bytes) + "\n";
+    meta += "depth_subresources=" + std::to_string(depth.subresources) + "\n";
+    for (size_t i = 0; i < depth.footprints.size(); ++i)
     {
-        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& f = slot.depthFootprints[i];
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& f = depth.footprints[i];
         const std::string prefix = "depth_plane" + std::to_string(i) + "_";
         meta += prefix + "offset=" + std::to_string(f.Offset) + "\n";
         meta += prefix + "width=" + std::to_string(f.Footprint.Width) + "\n";
@@ -652,18 +766,38 @@ bool MapOut(ID3D12Resource* buffer, UINT64 bytes, std::vector<uint8_t>& out)
 // with nothing distinguishing that from "never identified".
 bool DrainSlot(Slot& slot)
 {
-    std::vector<uint8_t> velocityData;
-    std::vector<uint8_t> colorData;
-    if (!MapOut(slot.velocityBuffer.Get(), slot.velocityBytes, velocityData) ||
-        !MapOut(slot.colorBuffer.Get(), slot.colorBytes, colorData))
+    // Velocity and the back buffer are what every downstream tool keys off, so
+    // a slot without both is not a capture. Kept explicit rather than folded
+    // into the loop because those two are load-bearing in a way the others are
+    // not - the `required` distinction in docs/REFACTOR_PLAN.md, which Phase 8
+    // turns into a mask frozen at burst arm.
+    std::vector<uint8_t> data[kMaxSurfaces];
+    bool mapped[kMaxSurfaces] = {};
+    if (!MapOut(
+            slot.surfaces[kSurfaceVelocity].readback.Get(),
+            slot.surfaces[kSurfaceVelocity].bytes,
+            data[kSurfaceVelocity]) ||
+        !MapOut(slot.surfaces[kSurfaceColor].readback.Get(), slot.surfaces[kSurfaceColor].bytes, data[kSurfaceColor]))
     {
         return false;
     }
+    mapped[kSurfaceVelocity] = true;
+    mapped[kSurfaceColor] = true;
 
-    std::vector<uint8_t> depthData;
-    const bool haveDepth = slot.hasDepth && MapOut(slot.depthBuffer.Get(), slot.depthBytes, depthData);
+    for (int i = 0; i < kSurfaceCount; ++i)
+    {
+        if (mapped[i] || !slot.surfaces[i].present)
+        {
+            continue;
+        }
+        mapped[i] = MapOut(slot.surfaces[i].readback.Get(), slot.surfaces[i].bytes, data[i]);
+    }
 
-    const size_t total = velocityData.size() + colorData.size() + depthData.size();
+    size_t total = 0;
+    for (int i = 0; i < kSurfaceCount; ++i)
+    {
+        total += data[i].size();
+    }
     if (!WriteQueueHasRoom(total))
     {
         const uint64_t n = g_droppedFrames.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -674,16 +808,22 @@ bool DrainSlot(Slot& slot)
         return false;
     }
 
+    // One loop, so a fourth surface is a table entry rather than another
+    // hand-written EnqueueWrite whose result someone forgets to check - as
+    // depth's was.
     char nameBuf[64]{};
-    sprintf_s(nameBuf, "vel_%05d.bin", slot.captureIndex);
-    const bool velOk = EnqueueWrite(DumpDir() + nameBuf, std::move(velocityData));
-    sprintf_s(nameBuf, "color_%05d.bin", slot.captureIndex);
-    const bool colorOk = EnqueueWrite(DumpDir() + nameBuf, std::move(colorData));
-    if (haveDepth)
+    bool written[kMaxSurfaces] = {};
+    for (int i = 0; i < kSurfaceCount; ++i)
     {
-        sprintf_s(nameBuf, "depth_%05d.bin", slot.captureIndex);
-        EnqueueWrite(DumpDir() + nameBuf, std::move(depthData));
+        if (!mapped[i])
+        {
+            continue;
+        }
+        sprintf_s(nameBuf, "%s_%05d.bin", kSurfaceSpecs[i].filePrefix, slot.captureIndex);
+        written[i] = EnqueueWrite(DumpDir() + nameBuf, std::move(data[i]));
     }
+    const bool velOk = written[kSurfaceVelocity];
+    const bool colorOk = written[kSurfaceColor];
 
     // Records which GAME frame this capture came from. Capture indices just
     // count what we drained, so adjacent indices aren't necessarily adjacent
@@ -817,11 +957,19 @@ Slot* AcquireSlotForFrame(unsigned long long frame)
         {
             candidate.frameIndex = frame;
             candidate.state = SlotState::Recording;
-            candidate.hasVelocity = false;
-            candidate.hasDepth = false;
-            candidate.depthCopies = 0;
-            candidate.recordedList = nullptr;
-            candidate.velocitySubmitted = false;
+            // Per-surface state resets in one loop, so a fourth surface cannot
+            // be left carrying the previous frame's flags. The readback buffer
+            // and its footprints deliberately survive - reusing them is the
+            // point of the ring, and EnsureReadback revalidates the layout
+            // before every copy anyway.
+            for (SurfaceCapture& surface : candidate.surfaces)
+            {
+                surface.present = false;
+                surface.copies = 0;
+                surface.recordedList = nullptr;
+                surface.queueSubmissionsAtRecord = 0;
+                surface.coverage = Coverage::None;
+            }
             return &candidate;
         }
     }
@@ -852,7 +1000,7 @@ void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velo
     Slot* slot = AcquireSlotForFrame(frame);
     // One velocity copy per frame; the buffer transitions twice per frame and
     // we only want the RENDER_TARGET -> ALL_SHADER_RESOURCE edge.
-    if (slot != nullptr && slot->hasVelocity)
+    if (slot != nullptr && slot->surfaces[kSurfaceVelocity].present)
     {
         return;
     }
@@ -875,8 +1023,9 @@ void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velo
                         states += "free";
                         break;
                     case SlotState::Recording:
-                        states += "recording@f" + std::to_string(s.frameIndex) + (s.hasVelocity ? "+vel" : "") +
-                                  (s.hasDepth ? "+depth" : "");
+                        states += "recording@f" + std::to_string(s.frameIndex) +
+                                  (s.surfaces[kSurfaceVelocity].present ? "+vel" : "") +
+                                  (s.surfaces[kSurfaceDepth].present ? "+depth" : "");
                         break;
                     case SlotState::Submitted:
                         states += "submitted@fence" + std::to_string(s.fenceValue);
@@ -892,58 +1041,33 @@ void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velo
         return;
     }
 
-    // Footprints only valid for the exact layout derived from, so the desc is
-    // compared every frame rather than trusted once. Render resolution can
-    // change mid-session (dynamic resolution scaling); stale footprints would
-    // silently corrupt the copy into plausible-looking garbage.
     const D3D12_RESOURCE_DESC desc = velocity->GetDesc();
-    if (!DumpLayoutAccepts(kSurfaceVelocity, "velocity", desc))
+    if (!DumpLayoutAccepts(kSurfaceVelocity, desc))
     {
         return;
     }
-    if (slot->velocityBuffer == nullptr || !SameLayout(slot->velocityDesc, desc))
+    SurfaceCapture& surface = slot->surfaces[kSurfaceVelocity];
+    if (!EnsureReadback(surface, kSurfaceVelocity, desc))
     {
-        if (slot->velocityBuffer != nullptr)
-        {
-            Log("capture: velocity layout changed, " + DescToString(slot->velocityDesc) + " -> " + DescToString(desc) +
-                "; rebuilding footprints. Identification is re-run when this "
-                "happens (see ReopenIdentification), so the resource is re-found rather than lost "
-                "for the rest of the session as it was before.");
-        }
-        const UINT subresources = SubresourceCountFor(g_device.Get(), desc);
-        slot->velocityFootprints.resize(subresources);
-        UINT64 total = 0;
-        g_device->GetCopyableFootprints(
-            &desc, 0, subresources, 0, slot->velocityFootprints.data(), nullptr, nullptr, &total);
-        slot->velocityBytes = total;
-        slot->velocitySubresources = subresources;
-        slot->velocityDesc = desc;
-        slot->velocityBuffer.Reset();
-        if (!CreateReadbackBuffer(g_device.Get(), total, slot->velocityBuffer))
-        {
-            Log("capture: failed to create velocity readback buffer");
-            return;
-        }
-        Log("capture: velocity readback buffer created, " + std::to_string(total) + " bytes, " +
-            std::to_string(subresources) +
-            " subresource(s), rowPitch=" + std::to_string(slot->velocityFootprints[0].Footprint.RowPitch));
+        return;
     }
 
     RecordCopyToReadback(
         cmdList,
         velocity,
-        slot->velocityBuffer.Get(),
-        slot->velocityFootprints,
+        surface.readback.Get(),
+        surface.footprints,
         static_cast<D3D12_RESOURCE_STATES>(stateAfter),
         g_originalResourceBarrier);
 
     // Remember which command list this copy went onto so fence coverage can
     // be checked, not assumed (see NoteSubmission). Stored as COM identity,
     // not the raw interface pointer (see ComIdentity).
-    slot->recordedList = ComIdentity(cmdList);
-    slot->velocitySubmitted = false;
-    slot->queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
-    slot->hasVelocity = true;
+    surface.recordedList = ComIdentity(cmdList);
+    surface.coverage = Coverage::None;
+    surface.queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
+    ++surface.copies;
+    surface.present = true;
 }
 
 void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, int stateAfter)
@@ -970,26 +1094,26 @@ void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, 
 
     const unsigned long long frame = g_frameIndex.load(std::memory_order_relaxed);
     Slot* slot = AcquireSlotForFrame(frame);
-    if (slot == nullptr || slot->depthCopies >= kMaxDepthCopiesPerFrame)
+    if (slot == nullptr || slot->surfaces[kSurfaceDepth].copies >= kMaxDepthCopiesPerFrame)
     {
         // No slot free means this frame is being skipped anyway; the velocity
         // path logs that case in detail and there is nothing to add here.
         return;
     }
-    if (slot->hasVelocity && slot->depthCopies > 0)
+    if (slot->surfaces[kSurfaceVelocity].present && slot->surfaces[kSurfaceDepth].copies > 0)
     {
         // Stop once velocity has been recorded, so the dump gets the LAST
         // depth edge BEFORE velocity became readable - the depth the frame's
         // velocity was rendered against. Also caps bandwidth: depth copies
         // can be the bulk of per-frame write volume.
         //
-        // The `depthCopies > 0` half is a fallback for titles where depth
+        // The `copies > 0` half is a fallback for titles where depth
         // becomes readable AFTER velocity (frame graph ordered differently
         // than UE5's default prepass/base-pass) - without it such a title
         // would silently capture no depth at all.
         return;
     }
-    if (slot->hasVelocity && !g_depthAfterVelocityReported.exchange(true))
+    if (slot->surfaces[kSurfaceVelocity].present && !g_depthAfterVelocityReported.exchange(true))
     {
         Log("capture: this title's depth buffer becomes readable only AFTER the velocity buffer "
             "does, so the depth in the dump is from a pass that ran after velocity was finished. "
@@ -998,50 +1122,34 @@ void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, 
     }
 
     const D3D12_RESOURCE_DESC desc = depth->GetDesc();
-    if (!DumpLayoutAccepts(kSurfaceDepth, "depth", desc))
+    if (!DumpLayoutAccepts(kSurfaceDepth, desc))
     {
         return;
     }
-    if (slot->depthBuffer == nullptr || !SameLayout(slot->depthDesc, desc))
+    SurfaceCapture& surface = slot->surfaces[kSurfaceDepth];
+    const bool firstUse = surface.readback == nullptr;
+    if (!EnsureReadback(surface, kSurfaceDepth, desc))
     {
-        if (slot->depthBuffer != nullptr)
-        {
-            Log("capture: depth layout changed, " + DescToString(slot->depthDesc) + " -> " + DescToString(desc) +
-                "; rebuilding footprints");
-        }
-        const UINT subresources = SubresourceCountFor(g_device.Get(), desc);
-        slot->depthFootprints.resize(subresources);
-        UINT64 total = 0;
-        g_device->GetCopyableFootprints(
-            &desc, 0, subresources, 0, slot->depthFootprints.data(), nullptr, nullptr, &total);
-        slot->depthBytes = total;
-        slot->depthSubresources = subresources;
-        slot->depthDesc = desc;
-        slot->depthBuffer.Reset();
-        if (!CreateReadbackBuffer(g_device.Get(), total, slot->depthBuffer))
-        {
-            Log("capture: failed to create depth readback buffer");
-            return;
-        }
-        Log("capture: depth readback buffer created, " + std::to_string(total) + " bytes, " +
-            std::to_string(subresources) +
-            " subresource(s) (plane count comes from the desc: a D24S8 or "
-            "D32S8 depth buffer is two planes, and copying only the first would silently truncate it)");
-        if (!g_depthMetadataWritten.exchange(true))
-        {
-            WriteDepthMetadata(*slot);
-        }
+        return;
+    }
+    if (firstUse && !g_depthMetadataWritten.exchange(true))
+    {
+        WriteDepthMetadata(*slot);
     }
 
     RecordCopyToReadback(
         cmdList,
         depth,
-        slot->depthBuffer.Get(),
-        slot->depthFootprints,
+        surface.readback.Get(),
+        surface.footprints,
         static_cast<D3D12_RESOURCE_STATES>(stateAfter),
         g_originalResourceBarrier);
-    ++slot->depthCopies;
-    slot->hasDepth = true;
+    // Recorded on the GAME's command list, exactly like velocity, so it needs
+    // the same coverage key - it simply never had anywhere to put one.
+    surface.recordedList = ComIdentity(cmdList);
+    surface.queueSubmissionsAtRecord = g_queueSubmissions.load(std::memory_order_relaxed);
+    ++surface.copies;
+    surface.present = true;
 
     // Depth edge count per frame depends on the title's frame graph (full
     // prepass = 1, partial prepass = 2); "last one wins" only means what it
@@ -1049,7 +1157,7 @@ void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, 
     const uint64_t seen = g_depthEdgeReports.fetch_add(1, std::memory_order_relaxed);
     if (seen < 8)
     {
-        Log("capture: depth copy " + std::to_string(slot->depthCopies) + " of frame " + std::to_string(frame) +
+        Log("capture: depth copy " + std::to_string(surface.copies) + " of frame " + std::to_string(frame) +
             " recorded (stateAfter=" + std::to_string(stateAfter) +
             "). The last copy of a frame is the one that lands in the dump.");
     }
@@ -1070,19 +1178,29 @@ void NoteSubmission(ID3D12CommandQueue* queue, UINT numCommandLists, ID3D12Comma
     }
     for (Slot& slot : g_slots)
     {
-        if (slot.state != SlotState::Recording || slot.recordedList == nullptr)
+        if (slot.state != SlotState::Recording)
+        {
+            continue;
+        }
+        // Velocity only, for now: this reshape moves the key into the surface
+        // that owns it but deliberately does not change what is graded, so the
+        // dump and the burst summary stay identical. Grading depth as well -
+        // its copy also rides the game's list and has never been checked - is a
+        // visible behaviour change and belongs in its own commit.
+        SurfaceCapture& surface = slot.surfaces[kSurfaceVelocity];
+        if (surface.recordedList == nullptr)
         {
             continue;
         }
         for (UINT i = 0; i < numCommandLists; ++i)
         {
-            if (ComIdentity(commandLists[i]) != slot.recordedList)
+            if (ComIdentity(commandLists[i]) != surface.recordedList)
             {
                 continue;
             }
             if (queue == g_queue.Get())
             {
-                slot.velocitySubmitted = true;
+                surface.coverage = Coverage::Strong;
             }
             else
             {
@@ -1170,7 +1288,6 @@ void OnPresent(IDXGISwapChain* swapChain)
         {
             Log("capture: reclaiming stale slot from frame " + std::to_string(candidate.frameIndex) +
                 " (never paired with a Present; now at frame " + std::to_string(frame) + ")");
-            candidate.recordedList = nullptr;
             candidate.state = SlotState::Free;
         }
     }
@@ -1189,7 +1306,7 @@ void OnPresent(IDXGISwapChain* swapChain)
     {
         return;
     }
-    if (!slot->hasVelocity)
+    if (!slot->surfaces[kSurfaceVelocity].present)
     {
         // Depth (or nothing) arrived but velocity did not. Every downstream
         // tool keys off velocity, so a frame without it isn't a capture -
@@ -1200,7 +1317,6 @@ void OnPresent(IDXGISwapChain* swapChain)
             Log("capture: frame " + std::to_string(frame) + " had no velocity copy (" + std::to_string(n) +
                 " such frames so far). Releasing the slot; nothing is written for this frame.");
         }
-        slot->recordedList = nullptr;
         slot->state = SlotState::Free;
         return;
     }
@@ -1215,7 +1331,7 @@ void OnPresent(IDXGISwapChain* swapChain)
     // Gates on the artefact having been produced at least once, so a title
     // that never identifies depth still captures velocity rather than nothing.
     const char* missing = nullptr;
-    if (!slot->hasDepth && DepthCaptureEnabled() && IdentifiedDepthResource() != nullptr)
+    if (!slot->surfaces[kSurfaceDepth].present && DepthCaptureEnabled() && IdentifiedDepthResource() != nullptr)
     {
         missing = "depth";
     }
@@ -1228,7 +1344,6 @@ void OnPresent(IDXGISwapChain* swapChain)
                 " (a burst usually starts mid-frame). Dropping it so the dump stays homogeneous - " +
                 std::to_string(n) + " so far.");
         }
-        slot->recordedList = nullptr;
         slot->state = SlotState::Free;
         return;
     }
@@ -1251,49 +1366,35 @@ void OnPresent(IDXGISwapChain* swapChain)
     // transition recreates swapchain buffers at a new size, and stale
     // footprints would corrupt silently.
     const D3D12_RESOURCE_DESC desc = backBuffer->GetDesc();
-    if (!DumpLayoutAccepts(kSurfaceColor, "back buffer", desc))
+    if (!DumpLayoutAccepts(kSurfaceColor, desc))
     {
         // The slot stays Recording and is reclaimed by the stale-slot sweep
         // above on a later Present. Nothing is written for this frame, which is
         // the point - it would be the first frame at the new layout.
         return;
     }
-    if (slot->colorBuffer == nullptr || !SameLayout(slot->colorDesc, desc))
+    SurfaceCapture& color = slot->surfaces[kSurfaceColor];
+    const bool firstColorUse = color.readback == nullptr;
+    if (!EnsureReadback(color, kSurfaceColor, desc))
     {
-        if (slot->colorBuffer != nullptr)
-        {
-            Log("capture: back buffer layout changed, " + DescToString(slot->colorDesc) + " -> " + DescToString(desc) +
-                "; rebuilding footprints");
-        }
-        const UINT subresources = SubresourceCountFor(g_device.Get(), desc);
-        slot->colorFootprints.resize(subresources);
-        UINT64 total = 0;
-        g_device->GetCopyableFootprints(
-            &desc, 0, subresources, 0, slot->colorFootprints.data(), nullptr, nullptr, &total);
-        slot->colorBytes = total;
-        slot->colorSubresources = subresources;
-        slot->colorDesc = desc;
-        slot->colorBuffer.Reset();
-        if (!CreateReadbackBuffer(g_device.Get(), total, slot->colorBuffer))
-        {
-            Log("capture: failed to create colour readback buffer");
-            return;
-        }
-        if (!g_metadataWritten.exchange(true))
-        {
-            WriteMetadata(*slot);
-        }
+        return;
+    }
+    if (firstColorUse && !g_metadataWritten.exchange(true))
+    {
+        WriteMetadata(*slot);
     }
 
     // The fence signalled below covers the velocity copy only if the game has
     // already submitted the list it was recorded onto. NoteSubmission checks
     // this rather than assuming it, so an unmet case is reported instead of
     // silently producing a stale readback.
-    if (slot->velocitySubmitted)
+    if (slot->surfaces[kSurfaceVelocity].coverage == Coverage::Strong)
     {
         g_coverageStrong.fetch_add(1, std::memory_order_relaxed);
     }
-    else if (g_queueSubmissions.load(std::memory_order_relaxed) > slot->queueSubmissionsAtRecord)
+    else if (
+        g_queueSubmissions.load(std::memory_order_relaxed) >
+        slot->surfaces[kSurfaceVelocity].queueSubmissionsAtRecord)
     {
         g_coverageWeak.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1330,10 +1431,16 @@ void OnPresent(IDXGISwapChain* swapChain)
     RecordCopyToReadback(
         slot->commandList.Get(),
         backBuffer.Get(),
-        slot->colorBuffer.Get(),
-        slot->colorFootprints,
+        color.readback.Get(),
+        color.footprints,
         D3D12_RESOURCE_STATE_PRESENT,
         g_originalResourceBarrier);
+    // Our list, our submit, immediately before the Signal below - so there is
+    // nothing to check and nothing that could make it stale. Recorded as its
+    // own value rather than a Strong that would mean something different.
+    color.coverage = Coverage::ByConstruction;
+    ++color.copies;
+    color.present = true;
 
     if (FAILED(slot->commandList->Close()))
     {
@@ -1350,7 +1457,6 @@ void OnPresent(IDXGISwapChain* swapChain)
     }
 
     slot->captureIndex = g_captureCounter.fetch_add(1);
-    slot->recordedList = nullptr;
     slot->state = SlotState::Submitted;
 
     const int remaining = g_framesRemaining.fetch_sub(1) - 1;
