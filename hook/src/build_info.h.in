@@ -14,4 +14,8 @@
 namespace mv
 {
 inline constexpr const char* kBuildGitCommit = "@MV_GIT_COMMIT@";
+// When CMake configured this build, UTC, ISO 8601. Not when the commit was
+// made - when THIS BINARY was configured, which is what "was this DLL built
+// from what I think it was built from" actually needs.
+inline constexpr const char* kBuildConfiguredUtc = "@MV_BUILD_UTC@";
 }

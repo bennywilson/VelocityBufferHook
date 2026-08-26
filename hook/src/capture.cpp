@@ -1,5 +1,6 @@
 #include "capture.h"
 
+#include "build_info.h"
 #include "depth_identify.h"
 #include "logging.h"
 #include "velocity_identify.h"
@@ -246,6 +247,12 @@ UINT64 g_nextFenceValue = 1;
 std::atomic<uint64_t> g_coverageStrong{0};
 std::atomic<uint64_t> g_coverageWeak{0};
 std::atomic<uint64_t> g_coverageNone{0};
+// Colour's equivalent of the three above: tallied once per frame, right
+// where color.coverage is set to ByConstruction. Not "strong" - a materially
+// different fact (no fence check was needed at all, not "one was performed
+// and passed") - so it gets its own counter rather than folding into
+// g_coverageStrong.
+std::atomic<uint64_t> g_coverageByConstruction{0};
 std::atomic<uint64_t> g_queueSubmissions{0};
 
 std::atomic<int> g_framesRemaining{0};
@@ -440,6 +447,11 @@ struct WriteJob
     std::string path;
     std::vector<uint8_t> data;
     bool append = false;
+    // Non-empty only for the manifest: written to `path` (a .tmp file) and,
+    // once that succeeds, atomically renamed over this. MoveFileExA is the
+    // Windows atomic-rename primitive - a reader sees the old file or the
+    // whole new one, never a torn one.
+    std::string renameTo;
 };
 
 // Backpressure cap. An unbounded queue never stalls the render thread but
@@ -550,6 +562,17 @@ void WriterThread()
         WriteFile(file, job.data.data(), static_cast<DWORD>(job.data.size()), &written, nullptr);
         CloseHandle(file);
 
+        if (!job.renameTo.empty())
+        {
+            if (!MoveFileExA(job.path.c_str(), job.renameTo.c_str(), MOVEFILE_REPLACE_EXISTING))
+            {
+                Log("capture: failed to seal " + job.renameTo + " (rename from " + job.path +
+                    ") err=" + std::to_string(GetLastError()) +
+                    " - the dump's blobs are all on disk, but nothing names them; delete the stray .tmp "
+                    "file and re-seal by pressing F8 again, or note this session's manifest is missing");
+            }
+        }
+
         // Confirms everything handed over so far is actually on disk - this,
         // not "burst recorded", is the signal it's safe to quit.
         std::lock_guard<std::mutex> lock(g_writeMutex);
@@ -569,8 +592,10 @@ bool WriteQueueHasRoom(size_t bytes)
     return g_queuedBytes + bytes <= kMaxQueuedBytes;
 }
 
-// Returns false if the job was dropped for backpressure.
-bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = false)
+// Returns false if the job was dropped for backpressure. `renameTo` non-empty
+// marks this as a manifest-style write (see WriteJob) and always goes
+// through regardless of size, same as meta.txt/frames.csv already do.
+bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = false, std::string renameTo = {})
 {
     {
         std::lock_guard<std::mutex> lock(g_writeMutex);
@@ -583,10 +608,10 @@ bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = fal
             g_writerStarted = true;
             g_writerThread = std::thread(WriterThread);
         }
-        // Small bookkeeping writes (metadata, frame index sidecar) always go
-        // through - dropping them loses the ability to interpret the frames
-        // that did make it.
-        if (data.size() > 4096 && g_queuedBytes + data.size() > kMaxQueuedBytes)
+        // Small bookkeeping writes (metadata, frame index sidecar, manifest)
+        // always go through - dropping them loses the ability to interpret
+        // the frames that did make it.
+        if (renameTo.empty() && data.size() > 4096 && g_queuedBytes + data.size() > kMaxQueuedBytes)
         {
             const uint64_t n = g_droppedWrites.fetch_add(1) + 1;
             Log("capture: WRITE QUEUE FULL (" + std::to_string(g_queuedBytes / (1024 * 1024)) +
@@ -594,7 +619,7 @@ bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = fal
             return false;
         }
         g_queuedBytes += data.size();
-        g_writeQueue.push_back(WriteJob{std::move(path), std::move(data), append});
+        g_writeQueue.push_back(WriteJob{std::move(path), std::move(data), append, std::move(renameTo)});
     }
     g_writeCv.notify_one();
     return true;
@@ -820,6 +845,34 @@ void RecordCopyToReadback(
     barrierFn(cmdList, 1, &barrier);
 }
 
+// The engine version the dump was captured against, if the operator supplied
+// one. One parser, used by both meta.txt and manifest.json, so they cannot
+// report different answers for the same session.
+//
+// Operator-supplied via MV_ENGINE_VERSION=5.2; unset stays unset rather than
+// guessing - matters because 5.7.1 steals bits of channel 3 for
+// bHasPixelAnimation and 5.2 doesn't, so a wrong guess mis-decodes silently.
+bool ParseEngineVersion(int* major, int* minor)
+{
+    char version[32]{};
+    const DWORD length = GetEnvironmentVariableA("MV_ENGINE_VERSION", version, sizeof(version));
+    if (length == 0 || length >= sizeof(version))
+    {
+        return false;
+    }
+    const std::string value(version, length);
+    const size_t dot = value.find('.');
+    if (dot == std::string::npos)
+    {
+        Log("capture: MV_ENGINE_VERSION='" + value +
+            "' is not in major.minor form; not recording it rather than recording a guess");
+        return false;
+    }
+    *major = atoi(value.c_str());
+    *minor = atoi(value.c_str() + dot + 1);
+    return true;
+}
+
 void WriteMetadata(const Slot& slot)
 {
     // Both formats come from the descs the footprints were derived from, not
@@ -847,28 +900,14 @@ void WriteMetadata(const Slot& slot)
     meta += "color_subresources=" + std::to_string(color.subresources) + "\n";
     // Engine version the dump came from, recorded per capture so the offline
     // decode doesn't rely on a module-global default (which silently
-    // mis-decodes the second of two dumps in a session). Matters because
-    // 5.7.1 steals bits of channel 3 for bHasPixelAnimation and 5.2 doesn't.
-    //
-    // Operator-supplied via MV_ENGINE_VERSION=5.2; unset stays unset rather
-    // than guessing.
+    // mis-decodes the second of two dumps in a session).
     {
-        char version[32]{};
-        const DWORD length = GetEnvironmentVariableA("MV_ENGINE_VERSION", version, sizeof(version));
-        if (length > 0 && length < sizeof(version))
+        int major = 0;
+        int minor = 0;
+        if (ParseEngineVersion(&major, &minor))
         {
-            const std::string value(version, length);
-            const size_t dot = value.find('.');
-            if (dot != std::string::npos)
-            {
-                meta += "engine_version_major=" + std::to_string(atoi(value.c_str())) + "\n";
-                meta += "engine_version_minor=" + std::to_string(atoi(value.c_str() + dot + 1)) + "\n";
-            }
-            else
-            {
-                Log("capture: MV_ENGINE_VERSION='" + value +
-                    "' is not in major.minor form; not recording it rather than recording a guess");
-            }
+            meta += "engine_version_major=" + std::to_string(major) + "\n";
+            meta += "engine_version_minor=" + std::to_string(minor) + "\n";
         }
     }
     EnqueueWrite(DumpDir() + "meta.txt", std::vector<uint8_t>(meta.begin(), meta.end()));
@@ -887,6 +926,308 @@ void WriteMetadata(const Slot& slot)
 // Every footprint is written, not just subresource 0: D24S8/D32S8 are
 // MULTI-PLANE (depth in plane 0, stencil in plane 1) with different formats
 // and row pitches.
+// ---------------------------------------------------------------------------
+// manifest.json - see docs/REFACTOR_PLAN.md sec 4.1 for the target schema
+// and this file's header comment for what is deliberately not yet in it.
+
+std::string JsonEscape(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s)
+    {
+        switch (c)
+        {
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            case '\n':
+                out += "\\n";
+                break;
+            case '\r':
+                out += "\\r";
+                break;
+            case '\t':
+                out += "\\t";
+                break;
+            default:
+                if (c < 0x20)
+                {
+                    char buf[8];
+                    sprintf_s(buf, "\\u%04x", c);
+                    out += buf;
+                }
+                else
+                {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
+std::string JsonString(const std::string& s)
+{
+    return "\"" + JsonEscape(s) + "\"";
+}
+
+// One plane's footprint, as a manifest object literal. Depth is two planes
+// (depth + stencil); velocity and colour are one.
+std::string PlaneJson(int index, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& f, int indent)
+{
+    const std::string pad(indent, ' ');
+    return pad + "{ \"index\": " + std::to_string(index) + ", \"offset\": " + std::to_string(f.Offset) +
+           ", \"width\": " + std::to_string(f.Footprint.Width) + ", \"height\": " +
+           std::to_string(f.Footprint.Height) + ", \"row_pitch\": " + std::to_string(f.Footprint.RowPitch) +
+           ", \"format\": " + std::to_string(static_cast<int>(f.Footprint.Format)) + " }";
+}
+
+std::string LayoutSurfaceJson(const DumpLayout& layout, int indent)
+{
+    const std::string pad(indent, ' ');
+    std::string out = pad + "{\n";
+    out += pad + "  \"format\": " + std::to_string(static_cast<int>(layout.desc.Format)) + ",\n";
+    out += pad + "  \"bytes\": " + std::to_string(layout.bytes) + ",\n";
+    out += pad + "  \"subresources\": " + std::to_string(layout.subresources) + ",\n";
+    out += pad + "  \"planes\": [\n";
+    for (size_t i = 0; i < layout.footprints.size(); ++i)
+    {
+        out += PlaneJson(static_cast<int>(i), layout.footprints[i], indent + 4);
+        out += (i + 1 < layout.footprints.size()) ? ",\n" : "\n";
+    }
+    out += pad + "  ]\n";
+    out += pad + "}";
+    return out;
+}
+
+// Static per-surface facts the manifest reports (trigger edge, arbitration
+// rule, file pattern). Written as literals here rather than as SurfaceSpec
+// fields: nothing in the code is DATA-DRIVEN by them yet (OnVelocityReadable
+// and OnDepthReadable are hardcoded functions, not dispatched off a spec) -
+// adding fields nothing reads would be exactly the kind of half-finished
+// abstraction the migration plan warns against. They become real SurfaceSpec
+// fields when SurfaceIdentifier (Phase 6-7) is what actually reads them.
+struct StaticSurfaceFacts
+{
+    const char* trigger;
+    const char* arbitration;
+    const char* filePattern;
+};
+constexpr StaticSurfaceFacts kStaticFacts[kSurfaceCount] = {
+    {"render_target_to_shader_resource", "first_in_frame", "vel_%05d.bin"},
+    {"depth_write_to_readable", "last_before_surface", "depth_%05d.bin"},
+    {"present_back_buffer", "first_in_frame", "color_%05d.bin"},
+};
+
+std::string ProcessBaseName()
+{
+    char path[MAX_PATH]{};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    const char* base = path;
+    for (const char* p = path; *p; ++p)
+    {
+        if (*p == '\\' || *p == '/')
+        {
+            base = p + 1;
+        }
+    }
+    return base;
+}
+
+std::string UtcNowIso8601()
+{
+    SYSTEMTIME t{};
+    GetSystemTime(&t);
+    char buf[32]{};
+    sprintf_s(
+        buf, "%04u-%02u-%02uT%02u:%02u:%02uZ", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    return buf;
+}
+
+// The first burst's start time for this dump directory - set once, on the
+// first ever burst-armed transition, matching the dump-directory-wide (not
+// per-burst) scope everything else about the dump layout already has.
+std::string g_dumpStartedUtc;
+
+// Assembles manifest.json's full content. Caller must hold g_mutex (reads
+// g_dumpLayout, g_burstEndReason, and friends without their own locking).
+std::string BuildManifest()
+{
+    std::string j;
+    j += "{\n";
+    j += "  \"schema_version\": 1,\n";
+    j += "  \"producer\": { \"tool\": \"mv_hook\", \"commit\": " + JsonString(kBuildGitCommit) +
+         ", \"configured_utc\": " + JsonString(kBuildConfiguredUtc) + " },\n";
+
+    const std::string process = ProcessBaseName();
+    const std::string sealedUtc = UtcNowIso8601();
+    j += "  \"session\": {\n";
+    j += "    \"process\": " + JsonString(process) + ",\n";
+    j += "    \"started_utc\": " + JsonString(g_dumpStartedUtc) + ",\n";
+    j += "    \"sealed_utc\": " + JsonString(sealedUtc) + ",\n";
+    // Profiles arrive in Phase 9; every dump today is captured against the
+    // hardcoded specs in this file, which is what "default" names.
+    j += "    \"profile\": \"default\",\n";
+    if (g_dumpLayout[kSurfaceColor].known)
+    {
+        const D3D12_RESOURCE_DESC& bb = g_dumpLayout[kSurfaceColor].desc;
+        j += "    \"back_buffer\": { \"width\": " + std::to_string(bb.Width) + ", \"height\": " +
+             std::to_string(bb.Height) + ", \"format\": " + std::to_string(static_cast<int>(bb.Format)) + " }\n";
+    }
+    else
+    {
+        j += "    \"back_buffer\": null\n";
+    }
+    j += "  },\n";
+
+    int engineMajor = 0;
+    int engineMinor = 0;
+    if (ParseEngineVersion(&engineMajor, &engineMinor))
+    {
+        j += "  \"engine\": { \"major\": " + std::to_string(engineMajor) + ", \"minor\": " +
+             std::to_string(engineMinor) + ", \"source\": \"MV_ENGINE_VERSION\" },\n";
+    }
+    else
+    {
+        j += "  \"engine\": null,\n";
+    }
+
+    static const char* const kReasonNames[] = {
+        "not_ended", "completed", "layout_changed", "velocity_pass_silent", "present_budget_exhausted"};
+    const BurstEndReason reason = g_burstEndReason.load(std::memory_order_relaxed);
+    j += "  \"burst\": {\n";
+    j += "    \"requested_frames\": " + std::to_string(kCaptureFrames) + ",\n";
+    j += "    \"recorded_frames\": " + std::to_string(g_captureCounter.load(std::memory_order_relaxed)) + ",\n";
+    j += "    \"drained_frames\": " + std::to_string(g_drainedFrames.load(std::memory_order_relaxed)) + ",\n";
+    j += "    \"ended_because\": " + JsonString(kReasonNames[static_cast<int>(reason)]) + "\n";
+    j += "  },\n";
+
+    j += "  \"surfaces\": {\n";
+    for (int i = 0; i < kSurfaceCount; ++i)
+    {
+        const DumpLayout& layout = g_dumpLayout[i];
+        const StaticSurfaceFacts& facts = kStaticFacts[i];
+        j += std::string("    ") + JsonString(kSurfaceSpecs[i].name == std::string("back buffer") ? "color"
+                                                                                                    : kSurfaceSpecs[i].name) +
+             ": {\n";
+        j += "      \"present\": " + std::string(layout.known ? "true" : "false") + ",\n";
+        if (!layout.known && i == kSurfaceDepth)
+        {
+            j += std::string("      \"reason\": ") +
+                 (DepthCaptureEnabled() ? "\"never_identified\"" : "\"capture_disabled\"") + ",\n";
+        }
+        j += "      \"required\": " + std::string((i != kSurfaceDepth || layout.known) ? "true" : "false") +
+             ",\n";
+        if (i == kSurfaceColor)
+        {
+            j += "      \"source\": { \"kind\": \"known_by_construction\", \"mechanism\": "
+                 "\"IDXGISwapChain3::GetBuffer(GetCurrentBackBufferIndex())\" },\n";
+        }
+        else
+        {
+            j += "      \"source\": { \"kind\": \"identified\" },\n";
+        }
+        j += std::string("      \"trigger\": ") + JsonString(facts.trigger) + ",\n";
+        j += std::string("      \"arbitration\": ") + JsonString(facts.arbitration) + ",\n";
+        j += std::string("      \"file_pattern\": ") + JsonString(facts.filePattern);
+        if (i == kSurfaceVelocity)
+        {
+            j += ",\n      \"coverage\": { \"strong\": " +
+                 std::to_string(g_coverageStrong.load(std::memory_order_relaxed)) + ", \"weak\": " +
+                 std::to_string(g_coverageWeak.load(std::memory_order_relaxed)) + ", \"none\": " +
+                 std::to_string(g_coverageNone.load(std::memory_order_relaxed)) + " }\n";
+        }
+        else if (i == kSurfaceColor)
+        {
+            j += ",\n      \"coverage\": { \"by_construction\": " +
+                 std::to_string(g_coverageByConstruction.load(std::memory_order_relaxed)) + " }\n";
+        }
+        else
+        {
+            // Depth's copy rides the game's command list exactly like
+            // velocity's, but nothing tallies whether the fence actually
+            // covers it - docs/REFACTOR_PLAN.md finding 1.2. Naming that
+            // honestly here, rather than reporting fabricated zeros a reader
+            // could mistake for "measured and found safe".
+            j += ",\n      \"coverage_note\": \"not evaluated - see docs/REFACTOR_PLAN.md finding 1.2\"\n";
+        }
+        j += std::string("    }") + (i + 1 < kSurfaceCount ? ",\n" : "\n");
+    }
+    j += "  },\n";
+
+    j += "  \"layouts\": [\n";
+    j += "    {\n";
+    j += "      \"epoch\": 0,\n";
+    j += "      \"surfaces\": {\n";
+    bool wroteAny = false;
+    std::string layoutSurfaces;
+    for (int i = 0; i < kSurfaceCount; ++i)
+    {
+        if (!g_dumpLayout[i].known)
+        {
+            continue;
+        }
+        if (wroteAny)
+        {
+            layoutSurfaces += ",\n";
+        }
+        const std::string name = (i == kSurfaceColor) ? "color" : kSurfaceSpecs[i].name;
+        layoutSurfaces += "        " + JsonString(name) + ": " + LayoutSurfaceJson(g_dumpLayout[i], 8);
+        wroteAny = true;
+    }
+    j += layoutSurfaces;
+    j += wroteAny ? "\n" : "";
+    j += "      }\n";
+    j += "    }\n";
+    j += "  ],\n";
+
+    j += "  \"frames\": {\n";
+    j += "    \"file\": \"frames.csv\",\n";
+    j += "    \"columns\": [\"capture_index\", \"game_frame_index\"],\n";
+    j += "    \"note\": \"wider columns (layout_epoch, surfaces_mask, coverage) arrive in Phase 5; this "
+         "dump's frames.csv is the 2-column format\"\n";
+    j += "  },\n";
+
+    j += "  \"integrity\": {\n";
+    j += "    \"sealed\": true,\n";
+    j += "    \"required_surfaces\": [\"velocity\", \"color\"";
+    if (g_dumpLayout[kSurfaceDepth].known)
+    {
+        j += ", \"depth\"";
+    }
+    j += "],\n";
+    j += "    \"dropped_frames_backpressure\": " + std::to_string(g_droppedFrames.load(std::memory_order_relaxed)) +
+         ",\n";
+    j += "    \"frames_without_velocity\": " +
+         std::to_string(g_framesWithoutVelocity.load(std::memory_order_relaxed)) + ",\n";
+    j += "    \"incomplete_frames_dropped\": " +
+         std::to_string(g_incompleteFrames.load(std::memory_order_relaxed)) + ",\n";
+    j += "    \"slots_missed_busy\": " + std::to_string(g_noFreeSlot.load(std::memory_order_relaxed)) + ",\n";
+    j += "    \"writes_dropped\": " + std::to_string(g_droppedWrites.load(std::memory_order_relaxed)) + "\n";
+    j += "  }\n";
+
+    j += "}\n";
+    return j;
+}
+
+// Builds and enqueues the manifest write. Always goes through the write
+// queue (bypassing backpressure, like meta.txt) as the LAST job for
+// everything already enqueued - see EnqueueWrite's renameTo handling and
+// this file's header comment for why FIFO ordering alone is what makes the
+// atomicity guarantee hold, with no additional synchronisation.
+void WriteManifestNow()
+{
+    const std::string json = BuildManifest();
+    EnqueueWrite(
+        DumpDir() + "manifest.json.tmp",
+        std::vector<uint8_t>(json.begin(), json.end()),
+        /*append=*/false,
+        /*renameTo=*/DumpDir() + "manifest.json");
+}
+
 void WriteDepthMetadata(const Slot& slot)
 {
     const SurfaceCapture& depth = slot.surfaces[kSurfaceDepth];
@@ -999,7 +1340,7 @@ bool DrainSlot(Slot& slot)
             continue;
         }
         sprintf_s(nameBuf, "%s_%05d.bin", kSurfaceSpecs[i].filePrefix, slot.captureIndex);
-        jobs.push_back(WriteJob{DumpDir() + nameBuf, std::move(data[i]), /*append=*/false});
+        jobs.push_back(WriteJob{DumpDir() + nameBuf, std::move(data[i]), /*append=*/false, /*renameTo=*/{}});
         haveVelocity = haveVelocity || i == kSurfaceVelocity;
         haveColor = haveColor || i == kSurfaceColor;
     }
@@ -1014,7 +1355,7 @@ bool DrainSlot(Slot& slot)
         char line[64]{};
         sprintf_s(line, "%d,%llu\n", slot.captureIndex, slot.frameIndex);
         jobs.push_back(WriteJob{DumpDir() + "frames.csv", std::vector<uint8_t>(line, line + strlen(line)),
-                                 /*append=*/true});
+                                 /*append=*/true, /*renameTo=*/{}});
     }
 
     const bool ok = EnqueueFrame(std::move(jobs)) && haveVelocity && haveColor;
@@ -1428,6 +1769,10 @@ void OnPresent(IDXGISwapChain* swapChain)
         g_burstPresentsLeft.store(kBurstPresentBudget);
         g_burstEndReason.store(BurstEndReason::NotEnded, std::memory_order_relaxed);
         g_manifestDirty.store(true, std::memory_order_relaxed);
+        if (g_dumpStartedUtc.empty())
+        {
+            g_dumpStartedUtc = UtcNowIso8601();
+        }
     }
 
     // End the burst if the game has stopped rendering the velocity pass -
@@ -1479,15 +1824,15 @@ void OnPresent(IDXGISwapChain* swapChain)
     // still-draining) burst is left in flight. Placed right after the drain
     // loop above, which is what can make DumpFullyDrained() newly true.
     //
-    // TODO(Phase 4c): replace this log line with the atomic manifest.json
-    // write it stands in for (docs/REFACTOR_PLAN.md sec 4.1).
     if (g_manifestDirty.load(std::memory_order_relaxed) && DumpFullyDrained())
     {
         static const char* const kReasonNames[] = {
             "not_ended", "completed", "layout_changed", "velocity_pass_silent", "present_budget_exhausted"};
         const BurstEndReason reason = g_burstEndReason.load(std::memory_order_relaxed);
         Log("capture: dump directory sealed - " + std::to_string(g_drainedFrames.load(std::memory_order_relaxed)) +
-            " frame(s) drained, ended_because=" + kReasonNames[static_cast<int>(reason)]);
+            " frame(s) drained, ended_because=" + kReasonNames[static_cast<int>(reason)] +
+            " - writing manifest.json");
+        WriteManifestNow();
         g_manifestDirty.store(false, std::memory_order_relaxed);
     }
 
@@ -1667,6 +2012,7 @@ void OnPresent(IDXGISwapChain* swapChain)
     // quiet.
     assert(kSurfaceSpecs[kSurfaceColor].source == SourceKind::KnownByConstruction);
     color.coverage = Coverage::ByConstruction;
+    g_coverageByConstruction.fetch_add(1, std::memory_order_relaxed);
     ++color.copies;
     color.present = true;
 

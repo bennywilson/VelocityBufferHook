@@ -16,6 +16,7 @@ execute_process(
 if(NOT MV_GIT_COMMIT_RESULT EQUAL 0 OR MV_GIT_COMMIT STREQUAL "")
   message(FATAL_ERROR "git rev-parse --short HEAD failed - is this a git checkout with at least one commit?")
 endif()
+string(TIMESTAMP MV_BUILD_UTC "%Y-%m-%dT%H:%M:%SZ" UTC)
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/build_info.h.in ${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.h @ONLY)
 # Re-run configure whenever HEAD moves (commit, checkout, merge), so the
 # embedded hash tracks it without a manual `cmake -B build -S .`. Does not
