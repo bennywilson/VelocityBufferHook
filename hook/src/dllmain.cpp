@@ -1,5 +1,8 @@
 #include <windows.h>
 
+#include <string>
+
+#include "build_info.h"
 #include "capture.h"
 #include "d3d12_hook.h"
 #include "depth_identify.h"
@@ -34,7 +37,7 @@ namespace {
 // into a process' memory. Calling Load/FreeLibrary, waiting on threads, or 
 // doing complex memory allocations while holding it can cause a deadlock.
 DWORD WINAPI InitThread(LPVOID) {
-    mv::Log("mv_hook: injected, InitThread running");
+    mv::Log(std::string("mv_hook: injected, InitThread running (build ") + mv::kBuildGitCommit + ")");
 
     if (!mv::InstallD3D12Hooks()) {
         mv::Log("mv_hook: D3D12 hook installation failed");
