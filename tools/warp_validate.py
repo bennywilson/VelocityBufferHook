@@ -40,9 +40,10 @@ import blockmatch
 import mvtools
 
 dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["TEMP"], "mv_dump")
-meta = mvtools.load_meta(dump_dir)
+dump = mvtools.load_dump(dump_dir)
+meta = dump.meta
 indices = mvtools.frame_indices(dump_dir)
-cw, ch = meta["color_width"], meta["color_height"]
+cw, ch = dump.surface("color").width, dump.surface("color").height
 
 grid_x, grid_y = np.meshgrid(np.arange(cw, dtype=np.float32), np.arange(ch, dtype=np.float32))
 

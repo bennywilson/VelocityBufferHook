@@ -60,8 +60,9 @@ LEGACY_UV_PER_UNIT_Y = +0.1991
 MIN_SCORE = 0.70
 
 dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["TEMP"], "mv_dump")
-meta = mvtools.load_meta(dump_dir)
-cw, ch = meta["color_width"], meta["color_height"]
+dump = mvtools.load_dump(dump_dir)
+meta = dump.meta
+cw, ch = dump.surface("color").width, dump.surface("color").height
 
 
 def gray(index):

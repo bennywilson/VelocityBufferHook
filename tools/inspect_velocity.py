@@ -10,7 +10,8 @@ import numpy as np
 import mvtools
 
 dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["TEMP"], "mv_dump")
-meta = mvtools.load_meta(dump_dir)
+dump = mvtools.load_dump(dump_dir)
+meta = dump.meta
 print("meta:", meta)
 
 # State the two things the decode depends on that are NOT in the pixel data, so

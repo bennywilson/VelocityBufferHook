@@ -56,12 +56,13 @@ VX_RANGE = (-2.0, 2.0)
 VY_RANGE = (-2.0, 2.0)
 VZ_RANGE = (-1e-5, 1e-5)
 
-meta = mvtools.load_meta(dump_dir)
+dump = mvtools.load_dump(dump_dir)
+meta = dump.meta
 vel_path = os.path.join(dump_dir, "wpo_vel_00000.bin")
 if not os.path.exists(vel_path):
     sys.exit(f"no {vel_path} - run mv_testhost.exe --wpo-encode-test \"{dump_dir}\" first")
 
-w, h = meta["velocity_width"], meta["velocity_height"]
+w, h = dump.surface("velocity").width, dump.surface("velocity").height
 print(f"dump: {w}x{h}, format {meta['velocity_format']}, "
       f"engine {meta.get('engine_version_major', '?')}.{meta.get('engine_version_minor', '?')}")
 

@@ -1,10 +1,26 @@
 """Decoding helpers for the raw buffers dumped by the hook.
 
-The hook writes untouched GPU bytes plus a meta.txt describing them, so all
-format knowledge lives here rather than in the injected DLL - keeping the
-in-process code as small and as low-risk as possible.
+The hook writes untouched GPU bytes plus a manifest.json describing them
+(docs/REFACTOR_PLAN.md sec 4.1), so all format knowledge lives here rather
+than in the injected DLL - keeping the in-process code as small and as
+low-risk as possible.
+
+load_dump() is the only supported door into a dump (sec 4.3): it gates on
+schema_version, refuses an unsealed dump unless told not to, and returns a
+Dump whose surfaces are typed by how their identity was established -
+IdentifiedSurface (found by search, has a coverage tally) or KnownSurface
+(given by an API contract, e.g. colour - no score, no signals, because there
+was nothing to search for). Every decode function below still takes a plain
+dict (`meta`), not a Surface - Dump.meta reconstructs that dict from the
+manifest so this file's numerically-sensitive decode code did not need to
+change shape for this migration.
 """
+import json
 import os
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
+
 import numpy as np
 
 # DXGI formats we actually encounter, verified against dxgiformat.h in the
@@ -38,31 +54,295 @@ VELOCITY_FORMATS = {
 }
 
 
-def load_meta(dump_dir):
-    """Everything the hook recorded about the dump's layout.
+# ---------------------------------------------------------------------------
+# The manifest-backed loader. See this file's module docstring and
+# docs/REFACTOR_PLAN.md sec 4.3 - this is the only supported door into a
+# dump; every other function in this file takes bytes or a dict this loader
+# produces, never a raw manifest.
 
-    Two files, merged. meta.txt is written once, when the colour readback
-    buffer is created; meta_depth.txt is written later, when (and only if)
-    scene depth was identified - depth identification cannot start until
-    velocity identification has produced an extent to test against, so
-    waiting for it before writing meta.txt would risk never writing meta.txt
-    at all on a session where depth is never found. A dump missing
-    meta_depth.txt is a dump with no depth in it, which is what it looks like
-    here too.
+SUPPORTED_SCHEMA = 1
+# Schema versions this build can still read, each mapped to a function that
+# upgrades that version's manifest dict to the current shape. Empty today -
+# schema_version 1 is the only version that has ever existed - but the seam
+# is here so a real migration is a function added to this dict, not a
+# reason to touch load_dump() itself.
+_MIGRATIONS = {}
+
+
+@dataclass(frozen=True)
+class Plane:
+    """One D3D12 subresource plane's footprint. Depth has two (depth,
+    stencil); velocity and colour have one."""
+    index: int
+    offset: int
+    width: int
+    height: int
+    row_pitch: int
+    format: int
+
+
+def _parse_planes(layout_obj):
+    if layout_obj is None:
+        return ()
+    return tuple(
+        Plane(p["index"], p["offset"], p["width"], p["height"], p["row_pitch"], p["format"])
+        for p in layout_obj.get("planes", []))
+
+
+@dataclass(frozen=True)
+class IdentifiedSurface:
+    """A surface whose identity came from the structural+behavioural search
+    (velocity, depth today).
+
+    Deliberately has no .score/.margin/.signals/.survivors attributes: the
+    hook does not track that state anywhere queryable yet (see the commit
+    that added manifest writing, docs/REFACTOR_PLAN.md Phase 4c-2) - it
+    exists only as local variables inside velocity_identify.cpp/
+    depth_identify.cpp's Decide() that get logged and discarded. Adding
+    placeholder fields for it here would invite exactly the kind of
+    silent-plausible-wrong reading this project's own README warns about
+    (the format-enum bug, the missing sqrt in the velocity decode - both
+    looked fine until checked against a primary source). It arrives once
+    Phase 6-7's SurfaceIdentifier owns that state.
     """
-    meta = {}
-    for name in ("meta.txt", "meta_depth.txt"):
-        path = os.path.join(dump_dir, name)
-        if not os.path.exists(path):
-            continue
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                meta[k] = int(v)
-    return meta
+    name: str
+    present: bool
+    required: bool
+    trigger: str
+    arbitration: str
+    file_pattern: str
+    format: Optional[int] = None
+    bytes: Optional[int] = None
+    subresources: Optional[int] = None
+    planes: tuple = ()
+    coverage: Optional[dict] = None       # velocity: {"strong","weak","none"}
+    coverage_note: Optional[str] = None   # depth: "not evaluated - ..."
+    reason: Optional[str] = None          # set only when not present
+
+    # Subresource 0 / plane 0 is the top mip / first plane, which is what
+    # every offline tool actually reads (matches WriteMetadata's own comment
+    # in capture.cpp) - exposed directly rather than making every caller
+    # write `.planes[0].width`.
+    @property
+    def width(self):
+        return self.planes[0].width
+
+    @property
+    def height(self):
+        return self.planes[0].height
+
+    @property
+    def row_pitch(self):
+        return self.planes[0].row_pitch
+
+
+@dataclass(frozen=True)
+class KnownSurface:
+    """A surface whose identity is given by a documented API contract, not
+    found by search - colour, today, via IDXGISwapChain::GetBuffer.
+
+    Deliberately has NO .score, .margin, .signals or .coverage_note
+    attribute: docs/REFACTOR_PLAN.md sec 3.1/4.3 wants a consumer that tries
+    to read identification evidence off a known-source surface to fail
+    loudly (AttributeError) rather than silently get None back - the whole
+    point of two dataclasses instead of one optional-field class.
+    """
+    name: str
+    present: bool
+    required: bool
+    mechanism: str
+    trigger: str
+    arbitration: str
+    file_pattern: str
+    format: Optional[int] = None
+    bytes: Optional[int] = None
+    subresources: Optional[int] = None
+    planes: tuple = ()
+    coverage: Optional[dict] = None       # {"by_construction": N}
+
+    @property
+    def width(self):
+        return self.planes[0].width
+
+    @property
+    def height(self):
+        return self.planes[0].height
+
+    @property
+    def row_pitch(self):
+        return self.planes[0].row_pitch
+
+
+def _parse_surface(name, obj, manifest):
+    present = bool(obj.get("present", False))
+    layout = None
+    if present:
+        layout = manifest.get("layouts", [{}])[0].get("surfaces", {}).get(name)
+        if layout is None:
+            raise KeyError(f"'{name}' is present but layouts[0].surfaces has no entry for it")
+
+    common = dict(
+        name=name,
+        present=present,
+        required=bool(obj.get("required", False)),
+        trigger=obj["trigger"],
+        arbitration=obj["arbitration"],
+        file_pattern=obj["file_pattern"],
+        format=layout["format"] if layout else None,
+        bytes=layout["bytes"] if layout else None,
+        subresources=layout["subresources"] if layout else None,
+        planes=_parse_planes(layout),
+    )
+    source = obj.get("source", {})
+    if source.get("kind") == "known_by_construction":
+        return KnownSurface(
+            mechanism=source.get("mechanism", ""),
+            coverage=obj.get("coverage"),
+            **common)
+    return IdentifiedSurface(
+        coverage=obj.get("coverage"),
+        coverage_note=obj.get("coverage_note"),
+        reason=obj.get("reason"),
+        **common)
+
+
+class Dump:
+    """A loaded, version-gated dump directory. Construct via load_dump()."""
+
+    def __init__(self, dump_dir, manifest, surfaces, unusable):
+        self.dir = dump_dir
+        self.manifest = manifest
+        self._surfaces = surfaces
+        self.unusable = unusable
+        self.migrated_from = None
+        self.notes = []
+
+    def has(self, name):
+        s = self._surfaces.get(name)
+        return s is not None and s.present
+
+    def surface(self, name):
+        """The named surface, typed IdentifiedSurface or KnownSurface.
+
+        Raises rather than returning None: KeyError for a name the manifest
+        never mentions, ValueError naming the manifest's own reason for a
+        surface that exists but is not present (or was refused as unusable).
+        """
+        s = self._surfaces.get(name)
+        if s is None:
+            if name in self.unusable:
+                raise ValueError(f"surface '{name}' is unusable: {self.unusable[name]}")
+            raise KeyError(f"no such surface in this manifest: '{name}'")
+        if not s.present:
+            reason = getattr(s, "reason", None) or "not present in this session"
+            raise ValueError(f"surface '{name}' is not present in this dump: {reason}")
+        return s
+
+    @property
+    def meta(self):
+        """Flat dict, field-for-field compatible with the pre-manifest
+        load_meta() output, so every existing decode function in this file
+        (all of which take this dict shape) works unchanged against a
+        manifest-backed Dump. Built fresh each access rather than cached -
+        this is a read of already-parsed data, not a file read.
+        """
+        m = {}
+        if self.has("velocity"):
+            v = self.surface("velocity")
+            p = v.planes[0]
+            m.update(velocity_width=p.width, velocity_height=p.height, velocity_row_pitch=p.row_pitch,
+                      velocity_format=v.format, velocity_bytes=v.bytes, velocity_subresources=v.subresources)
+        if self.has("color"):
+            c = self.surface("color")
+            p = c.planes[0]
+            m.update(color_width=p.width, color_height=p.height, color_row_pitch=p.row_pitch,
+                      color_format=c.format, color_bytes=c.bytes, color_subresources=c.subresources)
+        engine = self.manifest.get("engine")
+        if engine:
+            m["engine_version_major"] = engine["major"]
+            m["engine_version_minor"] = engine["minor"]
+        if self.has("depth"):
+            d = self.surface("depth")
+            m.update(depth_format=d.format, depth_bytes=d.bytes, depth_subresources=d.subresources)
+            for p in d.planes:
+                prefix = f"depth_plane{p.index}_"
+                m[prefix + "offset"] = p.offset
+                m[prefix + "width"] = p.width
+                m[prefix + "height"] = p.height
+                m[prefix + "row_pitch"] = p.row_pitch
+                m[prefix + "format"] = p.format
+        return m
+
+    def frame_indices(self):
+        return frame_indices(self.dir)
+
+    def pairs(self):
+        return consecutive_pairs(self.dir, self.frame_indices())
+
+
+def load_dump(dump_dir, *, allow_unsealed=False):
+    """The only supported way to open a dump. See docs/REFACTOR_PLAN.md
+    sec 4.3 for the full version-gate table this implements.
+    """
+    manifest_path = os.path.join(dump_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        legacy = os.path.join(dump_dir, "meta.txt")
+        if os.path.exists(legacy):
+            raise ValueError(
+                f"{dump_dir} is a pre-manifest dump (meta.txt but no manifest.json). Re-capture with a "
+                f"hook built after docs/REFACTOR_PLAN.md Phase 4 - load_dump() only reads manifest.json "
+                f"and does not fall back to the old format.")
+        raise ValueError(f"{dump_dir} has no manifest.json - not a dump this loader recognises")
+
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    version = manifest.get("schema_version")
+    if version is None:
+        raise ValueError(f"{manifest_path} has no schema_version - a manifest without one is not a manifest")
+    if version > SUPPORTED_SCHEMA:
+        raise ValueError(
+            f"{manifest_path} is schema_version {version}; this mvtools.py only understands up to "
+            f"{SUPPORTED_SCHEMA}. Never read forward-compatibly by guessing - update mvtools.py first.")
+    migrated_from = None
+    if version < SUPPORTED_SCHEMA:
+        if version not in _MIGRATIONS:
+            raise ValueError(
+                f"{manifest_path} is schema_version {version}, older than {SUPPORTED_SCHEMA}, and this "
+                f"mvtools.py has no migration registered for it (see _MIGRATIONS).")
+        manifest = _MIGRATIONS[version](manifest)
+        migrated_from = version
+
+    sealed = manifest.get("integrity", {}).get("sealed", False)
+    if not sealed and not allow_unsealed:
+        raise ValueError(
+            f"{manifest_path} is not sealed (integrity.sealed is false or absent) - this dump was not "
+            f"fully drained when its manifest was written. Pass allow_unsealed=True to read it anyway; "
+            f"frames may be missing or the layout may have changed mid-capture.")
+    if not sealed:
+        print(
+            f"WARNING: {dump_dir} is UNSEALED - reading anyway because allow_unsealed=True.\n"
+            f"         This dump may be missing frames, or describe a layout that changed mid-capture.\n"
+            f"         Treat every number from it as provisional.",
+            file=sys.stderr)
+
+    surfaces = {}
+    unusable = {}
+    for name, obj in manifest.get("surfaces", {}).items():
+        try:
+            surfaces[name] = _parse_surface(name, obj, manifest)
+        except (KeyError, TypeError) as e:
+            unusable[name] = str(e)
+
+    if "velocity" in unusable or surfaces.get("velocity") is None or not surfaces["velocity"].present:
+        reason = unusable.get("velocity") or "not present in this session"
+        raise ValueError(
+            f"{dump_dir}: velocity is unusable ({reason}) - every downstream tool keys off velocity, "
+            f"so this dump cannot be read at all")
+
+    dump = Dump(dump_dir, manifest, surfaces, unusable)
+    dump.migrated_from = migrated_from
+    return dump
 
 
 def _rows(path, width, height, row_pitch, bytes_per_pixel):
@@ -502,11 +782,6 @@ def frame_indices(dump_dir):
     return sorted(idx)
 
 
-# How many consecutive frames one F8 burst captures; must match kCaptureFrames
-# in hook/src/capture.cpp. Only used by the legacy fallback below.
-BURST = 60
-
-
 def load_frame_map(dump_dir):
     """capture index -> the game frame the capture came from, or None.
 
@@ -545,10 +820,15 @@ def consecutive_pairs(dump_dir, indices=None):
     index_set = set(indices)
     frames = load_frame_map(dump_dir)
     if frames is None:
-        # Legacy dumps: the best available proxy is "not on a burst boundary",
-        # which catches the gap between two F8 presses and nothing else.
-        pairs = [(i - 1, i) for i in indices if (i - 1) in index_set and i % BURST != 0]
-        return pairs, f"adjacency assumed (no frames.csv; burst-boundary rule, BURST={BURST})"
+        # A dump old enough to lack frames.csv also lacks manifest.json, so
+        # load_dump() already refuses it before any caller reaches here -
+        # this function is only ever called (via Dump.pairs()) on a dump
+        # that passed the loader gate. No fallback rule is needed any more
+        # (finding 1.17: the BURST constant this used to fall back to had
+        # drifted from kCaptureFrames for most of the project's life).
+        raise ValueError(
+            f"{dump_dir} has no frames.csv, so pairing cannot be verified. This should be unreachable "
+            f"through load_dump(), which refuses any dump this old before it gets here.")
     pairs = []
     dropped = 0
     for i in indices:

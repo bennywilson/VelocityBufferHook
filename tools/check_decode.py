@@ -38,10 +38,11 @@ import mvtools
 dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["TEMP"], "mv_dump")
 max_pairs = int(sys.argv[2]) if len(sys.argv) > 2 else 60
 
-meta = mvtools.load_meta(dump_dir)
+dump = mvtools.load_dump(dump_dir)
+meta = dump.meta
 indices = mvtools.frame_indices(dump_dir)
-cw, ch = meta["color_width"], meta["color_height"]
-vw, vh = meta["velocity_width"], meta["velocity_height"]
+cw, ch = dump.surface("color").width, dump.surface("color").height
+vw, vh = dump.surface("velocity").width, dump.surface("velocity").height
 
 # Integer search radius, in output-resolution pixels. Wide enough for the
 # fastest thing seen in these captures (a train at ~11px/frame).

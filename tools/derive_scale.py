@@ -46,9 +46,10 @@ import mvtools
 dump_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ["TEMP"], "mv_dump")
 stride = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 
-meta = mvtools.load_meta(dump_dir)
+dump = mvtools.load_dump(dump_dir)
+meta = dump.meta
 indices = mvtools.frame_indices(dump_dir)
-cw, ch = meta["color_width"], meta["color_height"]
+cw, ch = dump.surface("color").width, dump.surface("color").height
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
 

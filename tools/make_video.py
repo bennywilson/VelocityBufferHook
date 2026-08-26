@@ -44,10 +44,11 @@ if still_only:
         if str(still_index) in args:
             args.remove(str(still_index))
 
-meta = mvtools.load_meta(dump_dir)
+dump = mvtools.load_dump(dump_dir)
+meta = dump.meta
 indices = mvtools.frame_indices(dump_dir)
-cw, ch = meta["color_width"], meta["color_height"]
-vw, vh = meta["velocity_width"], meta["velocity_height"]
+cw, ch = dump.surface("color").width, dump.surface("color").height
+vw, vh = dump.surface("velocity").width, dump.surface("velocity").height
 
 # Target a fixed panel width rather than a fixed downscale ratio, so panel
 # (and text) size stays legible regardless of capture resolution. 640 was
