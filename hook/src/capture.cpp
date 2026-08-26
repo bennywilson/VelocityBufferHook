@@ -192,6 +192,67 @@ std::atomic<uint64_t> g_framesWithoutVelocity{0};
 std::atomic<uint64_t> g_incompleteFrames{0};
 
 // ---------------------------------------------------------------------------
+// One dump, one layout.
+//
+// meta.txt describes ONE set of extents, formats and row pitches, and it is
+// written once - the first time a readback buffer is created. The footprints it
+// describes, though, are rebuilt whenever a resource's layout changes, and
+// nothing rewrote the file when that happened. A dynamic-resolution title (this
+// one is: velocity renders at 1212x760 against a 1707x1067 back buffer) or an
+// adoption that lands on a differently-shaped velocity texture therefore
+// produced a dump whose later frames were captured at a layout the metadata did
+// not describe.
+//
+// That failure is invisible downstream. mvtools._rows() un-pads rows at
+// whatever row pitch it is handed and returns a plausible image at the wrong
+// stride - not an error, a picture. This is the same class of bug as decoding
+// velocity as linear: wrong everywhere, and it looks fine.
+//
+// Ending the burst is the only honest option while the metadata is per-dump
+// rather than per-frame. The proper fix is the versioned manifest with a
+// per-frame layout epoch (docs/REFACTOR_PLAN.md, Phase 4); until then a dump
+// holds exactly the layout it was opened at, and a change closes it.
+struct DumpLayout
+{
+    D3D12_RESOURCE_DESC desc{};
+    bool known = false;
+};
+
+constexpr int kSurfaceVelocity = 0;
+constexpr int kSurfaceDepth = 1;
+constexpr int kSurfaceColor = 2;
+DumpLayout g_dumpLayout[3];
+
+// Caller must hold g_mutex. Records the layout the first time a surface is
+// seen; afterwards returns false - having already ended the burst - if it has
+// changed. Deliberately NOT reset when a new burst is armed: two bursts into
+// one dump directory share one meta.txt, so the constraint is per dump, not
+// per burst.
+bool DumpLayoutAccepts(int surface, const char* name, const D3D12_RESOURCE_DESC& desc)
+{
+    DumpLayout& tracked = g_dumpLayout[surface];
+    if (!tracked.known)
+    {
+        tracked.desc = desc;
+        tracked.known = true;
+        return true;
+    }
+    if (SameLayout(tracked.desc, desc))
+    {
+        return true;
+    }
+    const int short_by = g_framesRemaining.exchange(0, std::memory_order_relaxed);
+    Log(std::string("capture: burst ENDED - the ") + name + " layout changed, " + DescToString(tracked.desc) + " -> " +
+        DescToString(desc) + ". This dump's meta.txt describes the first layout and the format has nowhere to record "
+        "a second, so continuing would write frames that every offline tool un-pads at the wrong row pitch - "
+        "producing a plausible image rather than an error. " +
+        std::to_string(short_by) +
+        " of the requested frames were not captured. Press F8 again with a FRESH MV_DUMP_DIR to capture at the new "
+        "layout; re-using this one would mix the two.");
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Background writer. Disk I/O never happens on the render thread - a
 // synchronous per-frame write there is a stall that can expose latent bugs
 // in the game (see DEBUGGING.md). Render thread only memcpy's out of the
@@ -836,6 +897,10 @@ void OnVelocityReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* velo
     // change mid-session (dynamic resolution scaling); stale footprints would
     // silently corrupt the copy into plausible-looking garbage.
     const D3D12_RESOURCE_DESC desc = velocity->GetDesc();
+    if (!DumpLayoutAccepts(kSurfaceVelocity, "velocity", desc))
+    {
+        return;
+    }
     if (slot->velocityBuffer == nullptr || !SameLayout(slot->velocityDesc, desc))
     {
         if (slot->velocityBuffer != nullptr)
@@ -933,6 +998,10 @@ void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, 
     }
 
     const D3D12_RESOURCE_DESC desc = depth->GetDesc();
+    if (!DumpLayoutAccepts(kSurfaceDepth, "depth", desc))
+    {
+        return;
+    }
     if (slot->depthBuffer == nullptr || !SameLayout(slot->depthDesc, desc))
     {
         if (slot->depthBuffer != nullptr)
@@ -1182,6 +1251,13 @@ void OnPresent(IDXGISwapChain* swapChain)
     // transition recreates swapchain buffers at a new size, and stale
     // footprints would corrupt silently.
     const D3D12_RESOURCE_DESC desc = backBuffer->GetDesc();
+    if (!DumpLayoutAccepts(kSurfaceColor, "back buffer", desc))
+    {
+        // The slot stays Recording and is reclaimed by the stale-slot sweep
+        // above on a later Present. Nothing is written for this frame, which is
+        // the point - it would be the first frame at the new layout.
+        return;
+    }
     if (slot->colorBuffer == nullptr || !SameLayout(slot->colorDesc, desc))
     {
         if (slot->colorBuffer != nullptr)
