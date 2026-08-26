@@ -323,11 +323,11 @@ bool DumpFullyDrained()
 }
 
 // Set whenever a burst is armed; cleared once DumpFullyDrained() has been
-// observed true and the (Phase 4c) manifest write for it has been enqueued.
-// Two bursts into the same MV_DUMP_DIR share this flag exactly like they
-// already share meta.txt - a second burst re-dirties it, and the eventual
-// seal reflects the cumulative state of the whole directory, not just the
-// latest burst.
+// observed true and the manifest write for it has been enqueued. Two
+// bursts into the same MV_DUMP_DIR share this flag - frames.csv worked the
+// same way even before manifest.json existed (see TruncateFramesCsv) - so a
+// second burst re-dirties it, and the eventual seal reflects the cumulative
+// state of the whole directory, not just the latest burst.
 std::atomic<bool> g_manifestDirty{false};
 
 // Frames skipped because every ring slot was in flight. Diagnostic only -
@@ -347,7 +347,6 @@ std::atomic<bool> g_metadataWritten{false};
 std::atomic<bool> g_hotkeyStop{false};
 std::thread g_hotkeyThread;
 
-std::atomic<bool> g_depthMetadataWritten{false};
 std::atomic<uint64_t> g_depthEdgeReports{0};
 std::atomic<bool> g_depthAfterVelocityReported{false};
 // Frames where depth arrived but velocity never did. Counted rather than
@@ -358,24 +357,28 @@ std::atomic<uint64_t> g_incompleteFrames{0};
 // ---------------------------------------------------------------------------
 // One dump, one layout.
 //
-// meta.txt describes ONE set of extents, formats and row pitches, and it is
-// written once - the first time a readback buffer is created. The footprints it
-// describes, though, are rebuilt whenever a resource's layout changes, and
-// nothing rewrote the file when that happened. A dynamic-resolution title (this
-// one is: velocity renders at 1212x760 against a 1707x1067 back buffer) or an
-// adoption that lands on a differently-shaped velocity texture therefore
-// produced a dump whose later frames were captured at a layout the metadata did
-// not describe.
+// manifest.json's "layouts" array (see BuildManifest) has exactly one entry,
+// epoch 0 - a genuine schema limitation, not yet the multi-epoch design
+// docs/REFACTOR_PLAN.md sec 4.1 sketches. Nothing describes a resource's
+// layout as a per-frame fact, only a per-dump one, so a resolution change
+// mid-dump has nowhere to be recorded once the first layout has been
+// snapshotted (see SnapshotDumpLayout).
 //
-// That failure is invisible downstream. mvtools._rows() un-pads rows at
-// whatever row pitch it is handed and returns a plausible image at the wrong
-// stride - not an error, a picture. This is the same class of bug as decoding
-// velocity as linear: wrong everywhere, and it looks fine.
+// Originally this guarded meta.txt/meta_depth.txt, which had the same
+// one-shot-write limitation for a stronger reason: they were written ONCE,
+// full stop, with no mechanism to update them at all - so a layout change
+// after that point left the file describing a layout that no longer
+// matched later frames, invisibly. mvtools._rows() would un-pad rows at
+// whatever row pitch it was handed and return a plausible image at the
+// wrong stride - not an error, a picture. This is the same class of bug as
+// decoding velocity as linear: wrong everywhere, and it looks fine.
+// manifest.json's single epoch is a milder version of the same limitation:
+// at least it is consistent for the frames it does describe, but a dump
+// spanning a resolution change still cannot represent both layouts.
 //
-// Ending the burst is the only honest option while the metadata is per-dump
-// rather than per-frame. The proper fix is the versioned manifest with a
-// per-frame layout epoch (docs/REFACTOR_PLAN.md, Phase 4); until then a dump
-// holds exactly the layout it was opened at, and a change closes it.
+// Ending the burst is the current, honest answer to that gap. A dump holds
+// exactly the layout it was opened at, and a layout change closes it rather
+// than silently mis-describing later frames.
 struct DumpLayout
 {
     D3D12_RESOURCE_DESC desc{};
@@ -408,8 +411,8 @@ void SnapshotDumpLayout(int surface, const SurfaceCapture& capture)
 // Caller must hold g_mutex. Records the layout the first time a surface is
 // seen; afterwards returns false - having already ended the burst - if it has
 // changed. Deliberately NOT reset when a new burst is armed: two bursts into
-// one dump directory share one meta.txt, so the constraint is per dump, not
-// per burst.
+// one dump directory share one manifest.json (and shared one meta.txt before
+// it existed), so the constraint is per dump, not per burst.
 bool DumpLayoutAccepts(int surface, const D3D12_RESOURCE_DESC& desc)
 {
     const char* name = kSurfaceSpecs[surface].name;
@@ -426,7 +429,7 @@ bool DumpLayoutAccepts(int surface, const D3D12_RESOURCE_DESC& desc)
     }
     const int short_by = EndBurst(BurstEndReason::LayoutChanged);
     Log(std::string("capture: burst ENDED - the ") + name + " layout changed, " + DescToString(tracked.desc) + " -> " +
-        DescToString(desc) + ". This dump's meta.txt describes the first layout and the format has nowhere to record "
+        DescToString(desc) + ". This dump's manifest.json describes the first layout and has nowhere to record "
         "a second, so continuing would write frames that every offline tool un-pads at the wrong row pitch - "
         "producing a plausible image rather than an error. " +
         std::to_string(short_by) +
@@ -517,8 +520,8 @@ bool DepthCaptureEnabled()
         if (off)
         {
             Log("capture: MV_CAPTURE_DEPTH=0 - scene depth will NOT be copied this session. The dump "
-                "will have no meta_depth.txt and no depth_*.bin. This is the bandwidth control test, "
-                "not a normal capture.");
+                "will have no depth_*.bin and manifest.json will report depth as not present. This is "
+                "the bandwidth control test, not a normal capture.");
         }
         return !off;
     }();
@@ -594,7 +597,7 @@ bool WriteQueueHasRoom(size_t bytes)
 
 // Returns false if the job was dropped for backpressure. `renameTo` non-empty
 // marks this as a manifest-style write (see WriteJob) and always goes
-// through regardless of size, same as meta.txt/frames.csv already do.
+// through regardless of size, same as frames.csv already does.
 bool EnqueueWrite(std::string path, std::vector<uint8_t> data, bool append = false, std::string renameTo = {})
 {
     {
@@ -846,8 +849,9 @@ void RecordCopyToReadback(
 }
 
 // The engine version the dump was captured against, if the operator supplied
-// one. One parser, used by both meta.txt and manifest.json, so they cannot
-// report different answers for the same session.
+// one. Used by BuildManifest's "engine" block - a leftover from when this
+// also fed meta.txt, kept as its own function rather than inlined so there
+// is still exactly one parser if a second consumer ever needs it.
 //
 // Operator-supplied via MV_ENGINE_VERSION=5.2; unset stays unset rather than
 // guessing - matters because 5.7.1 steals bits of channel 3 for
@@ -873,62 +877,25 @@ bool ParseEngineVersion(int* major, int* minor)
     return true;
 }
 
-void WriteMetadata(const Slot& slot)
+// meta.txt is gone (docs/REFACTOR_PLAN.md Phase 5 - manifest.json's
+// "layouts" block supersedes it; see BuildManifest). This keeps the other
+// half of what WriteMetadata used to do: truncating frames.csv's header so
+// a new session never appends onto a previous one's capture indices.
+void TruncateFramesCsv()
 {
-    // Both formats come from the descs the footprints were derived from, not
-    // hardcoded - a widened identification filter would otherwise mislabel
-    // the dump silently.
-    const SurfaceCapture& velocity = slot.surfaces[kSurfaceVelocity];
-    const SurfaceCapture& color = slot.surfaces[kSurfaceColor];
-    const DXGI_FORMAT velocityFormat = velocity.desc.Format;
-    const DXGI_FORMAT colorFormat = color.desc.Format;
-    std::string meta;
-    // Subresource 0 describes the top mip/first plane, which is what offline
-    // tools read. Subresource count is reported too, so multi-plane/mipped
-    // captures are self-describing.
-    meta += "velocity_width=" + std::to_string(velocity.footprints[0].Footprint.Width) + "\n";
-    meta += "velocity_height=" + std::to_string(velocity.footprints[0].Footprint.Height) + "\n";
-    meta += "velocity_row_pitch=" + std::to_string(velocity.footprints[0].Footprint.RowPitch) + "\n";
-    meta += "velocity_format=" + std::to_string(static_cast<int>(velocityFormat)) + "\n";
-    meta += "velocity_bytes=" + std::to_string(velocity.bytes) + "\n";
-    meta += "velocity_subresources=" + std::to_string(velocity.subresources) + "\n";
-    meta += "color_width=" + std::to_string(color.footprints[0].Footprint.Width) + "\n";
-    meta += "color_height=" + std::to_string(color.footprints[0].Footprint.Height) + "\n";
-    meta += "color_row_pitch=" + std::to_string(color.footprints[0].Footprint.RowPitch) + "\n";
-    meta += "color_format=" + std::to_string(static_cast<int>(colorFormat)) + "\n";
-    meta += "color_bytes=" + std::to_string(color.bytes) + "\n";
-    meta += "color_subresources=" + std::to_string(color.subresources) + "\n";
-    // Engine version the dump came from, recorded per capture so the offline
-    // decode doesn't rely on a module-global default (which silently
-    // mis-decodes the second of two dumps in a session).
-    {
-        int major = 0;
-        int minor = 0;
-        if (ParseEngineVersion(&major, &minor))
-        {
-            meta += "engine_version_major=" + std::to_string(major) + "\n";
-            meta += "engine_version_minor=" + std::to_string(minor) + "\n";
-        }
-    }
-    EnqueueWrite(DumpDir() + "meta.txt", std::vector<uint8_t>(meta.begin(), meta.end()));
-    // Truncate the per-frame sidecar so a new session never appends onto the
-    // previous one's indices.
     const std::string header = "# captureIndex,gameFrameIndex\n";
     EnqueueWrite(DumpDir() + "frames.csv", std::vector<uint8_t>(header.begin(), header.end()));
-    Log("capture: metadata written - " + meta);
 }
 
-// Depth metadata lives in its own file since meta.txt is written before
-// depth identification can even start (it needs velocity's extent first).
-// A dump without this file is a dump without depth - exactly what it looks
-// like.
-//
-// Every footprint is written, not just subresource 0: D24S8/D32S8 are
-// MULTI-PLANE (depth in plane 0, stencil in plane 1) with different formats
-// and row pitches.
 // ---------------------------------------------------------------------------
 // manifest.json - see docs/REFACTOR_PLAN.md sec 4.1 for the target schema
 // and this file's header comment for what is deliberately not yet in it.
+//
+// Depth's layout (including both planes - D24S8/D32S8 are MULTI-PLANE, depth
+// in plane 0 and stencil in plane 1, with different formats and row
+// pitches) lives in BuildManifest's "layouts" block, sourced from
+// g_dumpLayout via SnapshotDumpLayout. A dump with depth "not present" in
+// the manifest is a dump without depth - exactly what it looks like.
 
 std::string JsonEscape(const std::string& s)
 {
@@ -1214,10 +1181,11 @@ std::string BuildManifest()
 }
 
 // Builds and enqueues the manifest write. Always goes through the write
-// queue (bypassing backpressure, like meta.txt) as the LAST job for
-// everything already enqueued - see EnqueueWrite's renameTo handling and
-// this file's header comment for why FIFO ordering alone is what makes the
-// atomicity guarantee hold, with no additional synchronisation.
+// queue (bypassing backpressure, like frames.csv's header truncation) as the
+// LAST job for everything already enqueued - see EnqueueWrite's renameTo
+// handling and this file's header comment for why FIFO ordering alone is
+// what makes the atomicity guarantee hold, with no additional
+// synchronisation.
 void WriteManifestNow()
 {
     const std::string json = BuildManifest();
@@ -1226,27 +1194,6 @@ void WriteManifestNow()
         std::vector<uint8_t>(json.begin(), json.end()),
         /*append=*/false,
         /*renameTo=*/DumpDir() + "manifest.json");
-}
-
-void WriteDepthMetadata(const Slot& slot)
-{
-    const SurfaceCapture& depth = slot.surfaces[kSurfaceDepth];
-    std::string meta;
-    meta += "depth_format=" + std::to_string(static_cast<int>(depth.desc.Format)) + "\n";
-    meta += "depth_bytes=" + std::to_string(depth.bytes) + "\n";
-    meta += "depth_subresources=" + std::to_string(depth.subresources) + "\n";
-    for (size_t i = 0; i < depth.footprints.size(); ++i)
-    {
-        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& f = depth.footprints[i];
-        const std::string prefix = "depth_plane" + std::to_string(i) + "_";
-        meta += prefix + "offset=" + std::to_string(f.Offset) + "\n";
-        meta += prefix + "width=" + std::to_string(f.Footprint.Width) + "\n";
-        meta += prefix + "height=" + std::to_string(f.Footprint.Height) + "\n";
-        meta += prefix + "row_pitch=" + std::to_string(f.Footprint.RowPitch) + "\n";
-        meta += prefix + "format=" + std::to_string(static_cast<int>(f.Footprint.Format)) + "\n";
-    }
-    EnqueueWrite(DumpDir() + "meta_depth.txt", std::vector<uint8_t>(meta.begin(), meta.end()));
-    Log("capture: depth metadata written - " + meta);
 }
 
 // Maps one finished readback buffer out to a vector.
@@ -1667,10 +1614,6 @@ void OnDepthReadable(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* depth, 
     if (firstUse)
     {
         SnapshotDumpLayout(kSurfaceDepth, surface);
-        if (!g_depthMetadataWritten.exchange(true))
-        {
-            WriteDepthMetadata(*slot);
-        }
     }
 
     RecordCopyToReadback(
@@ -1942,7 +1885,7 @@ void OnPresent(IDXGISwapChain* swapChain)
         SnapshotDumpLayout(kSurfaceColor, color);
         if (!g_metadataWritten.exchange(true))
         {
-            WriteMetadata(*slot);
+            TruncateFramesCsv();
         }
     }
 
