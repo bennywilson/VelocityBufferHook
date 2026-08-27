@@ -17,3 +17,4 @@ mv_dump/
 __pycache__/
 *.pyc
 old/
+test_games/

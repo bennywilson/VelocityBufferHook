@@ -164,7 +164,7 @@ def render(index):
     p2[y0:y0 + s, x0:x0 + s] = np.maximum(p2[y0:y0 + s, x0:x0 + s], wheel)
     cv2.putText(p2, "dir", (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
-    frame = np.hstack([p1, p2, p3])
+    frame = np.vstack([p1, p2, p3])
     # Caption on its own bar so it stays readable over bright scene content.
     return np.vstack([frame, caption_bar(frame.shape[1], caption)])
 
@@ -185,7 +185,7 @@ if preview_only:
     print("wrote preview PNGs")
     sys.exit(0)
 
-writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), 60, (pw * 3, ph + 26))
+writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), 60, (pw, ph * 3 + 26))
 for index in indices:
     writer.write(render(index))
 writer.release()
